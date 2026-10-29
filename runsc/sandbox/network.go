@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/vishvananda/netlink"
@@ -259,21 +260,45 @@ func addrBitLength(ip net.IP) int {
 }
 
 // removeLinkAddresses removes IP addresses from the host NIC for a link.
+// It lists the addresses with full netlink attrs (Peer/Scope/Flags) and
+// AddrDel the actual struct. Required for point-to-point links (e.g. CF silk
+// CNI sets eth0 with IFA_LOCAL=local, IFA_ADDRESS=peer); ParseAddr-based
+// AddrDel uses IFA_ADDRESS=local and the kernel rejects with EADDRNOTAVAIL.
 func removeLinkAddresses(linkName string, addresses []boot.IPWithPrefix) error {
 	ifaceLink, err := netlink.LinkByName(linkName)
 	if err != nil {
 		return fmt.Errorf("getting link for interface %q: %w", linkName, err)
+	}
+	existing, err := netlink.AddrList(ifaceLink, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("listing addresses for interface %q: %w", linkName, err)
 	}
 	for _, addr := range addresses {
 		ipNet := &net.IPNet{
 			IP:   addr.Address,
 			Mask: net.CIDRMask(addr.PrefixLen, addrBitLength(addr.Address)),
 		}
-		if err := removeAddress(ifaceLink, ipNet.String()); err != nil {
-			// If we encounter an error while deleting the ip,
-			// verify the ip is still present on the interface.
-			if present, err := isAddressOnInterface(linkName, ipNet); err != nil {
-				return fmt.Errorf("checking if address %v is on interface %q: %w", ipNet, linkName, err)
+		var nlAddr *netlink.Addr
+		for i := range existing {
+			e := &existing[i]
+			if e.IPNet == nil || !e.IPNet.IP.Equal(ipNet.IP) {
+				continue
+			}
+			ep, _ := e.IPNet.Mask.Size()
+			lp, _ := ipNet.Mask.Size()
+			if ep != lp {
+				continue
+			}
+			nlAddr = e
+			break
+		}
+		if nlAddr == nil {
+			// Already gone.
+			continue
+		}
+		if err := netlink.AddrDel(ifaceLink, nlAddr); err != nil {
+			if present, perr := isAddressOnInterface(linkName, ipNet); perr != nil {
+				return fmt.Errorf("checking if address %v is on interface %q: %w", ipNet, linkName, perr)
 			} else if !present {
 				continue
 			}
@@ -286,7 +311,8 @@ func removeLinkAddresses(linkName string, addresses []boot.IPWithPrefix) error {
 // collectLinksAndRoutes queries the network interfaces in the current network
 // namespace and scrapes their configuration (addresses, routes, neighbors).
 // It returns the args to create them in the sandbox. This function has no
-// side effects on the interfaces themselves.
+// side effects on the interfaces themselves, except that it may send one UDP
+// datagram to a gateway that has no neighbor entry, to make the kernel resolve it.
 func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLinksAndRoutesArgs, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -342,17 +368,6 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLi
 			return boot.CreateLinksAndRoutesArgs{}, fmt.Errorf("fetching ARP table for %q: %w", iface.Name, err)
 		}
 
-		var neighbors []boot.Neighbor
-		for _, n := range dump {
-			// There are only two "good" states NUD_PERMANENT and NUD_REACHABLE,
-			// but NUD_REACHABLE is fully dynamic and will be re-probed anyway.
-			if n.State == netlink.NUD_PERMANENT {
-				log.Debugf("Copying a static ARP entry: %+v %+v", n.IP, n.HardwareAddr)
-				// No flags are copied because Stack.AddStaticNeighbor does not support flags right now.
-				neighbors = append(neighbors, boot.Neighbor{IP: n.IP, HardwareAddr: n.HardwareAddr})
-			}
-		}
-
 		// Scrape the routes before removing the address, since that
 		// will remove the routes as well.
 		routes, defv4, defv6, err := routesForIface(iface, disableIPv6)
@@ -374,6 +389,62 @@ func collectLinksAndRoutes(conf *config.Config, disableIPv6 bool) (boot.CreateLi
 			args.Defaultv6Gateway.Route = *defv6
 			args.Defaultv6Gateway.Name = iface.Name
 		}
+
+		// Seed the sandbox's neighbor cache for the link being moved. The
+		// kernel's static (PERMANENT) entries are always copied. Dynamic
+		// entries (REACHABLE, STALE, DELAY, PROBE) are copied only for the
+		// route gateways and the point-to-point peer of this link, because
+		// netstack never re-probes a static entry and a wrong MAC for any
+		// other host would stay pinned for the life of the sandbox. On
+		// silk-style /32 point-to-point links the sandbox's own ARP for the
+		// gateway is unreliable, so the gateway's MAC must be present.
+		gateways := gatewayIPs(routes, defv4, defv6)
+		var peers []net.IP
+		if link, lerr := netlink.LinkByIndex(iface.Index); lerr != nil {
+			log.Warningf("Cannot look up link %q to find its point-to-point peer: %v", iface.Name, lerr)
+		} else if linkAddrs, aerr := netlink.AddrList(link, netlink.FAMILY_ALL); aerr != nil {
+			log.Warningf("Cannot list addresses of %q to find its point-to-point peer: %v", iface.Name, aerr)
+		} else {
+			peers = peerIPs(linkAddrs)
+		}
+
+		// Warm up the kernel cache only when a gateway has no entry yet.
+		if missing := missingNeighbors(dump, gateways); len(missing) > 0 {
+			warmed := false
+			for _, gw := range missing {
+				if isIPv6LinkLocal(gw) {
+					// A link-local destination needs a scope id for connect(2),
+					// so the probe cannot be sent. Reported below if still missing.
+					continue
+				}
+				network := "udp4"
+				if gw.To4() == nil {
+					network = "udp6"
+				}
+				c, derr := net.DialUDP(network, nil, &net.UDPAddr{IP: gw, Port: 9})
+				if derr != nil {
+					log.Debugf("Neighbor warm-up: DialUDP(%s) on %q failed: %v", gw, iface.Name, derr)
+					continue
+				}
+				if _, werr := c.Write([]byte{}); werr != nil {
+					log.Debugf("Neighbor warm-up: write to %s on %q failed: %v", gw, iface.Name, werr)
+				}
+				c.Close()
+				warmed = true
+			}
+			if warmed {
+				time.Sleep(75 * time.Millisecond)
+				if redump, rerr := netlink.NeighList(iface.Index, 0); rerr != nil {
+					log.Warningf("Re-reading the neighbor table of %q after warm-up failed: %v", iface.Name, rerr)
+				} else {
+					dump = redump
+				}
+			}
+			for _, gw := range missingNeighbors(dump, gateways) {
+				log.Warningf("No neighbor entry for gateway %s on interface %q; the sandbox must resolve it itself", gw, iface.Name)
+			}
+		}
+		neighbors := selectNeighbors(dump, append(append([]net.IP{}, gateways...), peers...))
 
 		// Get the link for the interface.
 		ifaceLink, err := netlink.LinkByName(iface.Name)
@@ -803,17 +874,6 @@ func routesForIface(iface net.Interface, disableIPv6 bool) ([]boot.Route, *boot.
 		})
 	}
 	return routes, defv4, defv6, nil
-}
-
-// removeAddress removes IP address from network device. It's equivalent to:
-//
-//	ip addr del <ipAndMask> dev <name>
-func removeAddress(source netlink.Link, ipAndMask string) error {
-	addr, err := netlink.ParseAddr(ipAndMask)
-	if err != nil {
-		return err
-	}
-	return netlink.AddrDel(source, addr)
 }
 
 func pcapAndNAT(args *boot.CreateLinksAndRoutesArgs, conf *config.Config) error {
