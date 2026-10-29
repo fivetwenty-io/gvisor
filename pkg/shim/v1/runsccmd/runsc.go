@@ -17,9 +17,9 @@
 package runsccmd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -773,16 +773,29 @@ func (r *Runsc) command(context context.Context, args ...string) *exec.Cmd {
 }
 
 func cmdOutput(cmd *exec.Cmd, combined bool) ([]byte, []byte, error) {
-	stdout := getBuf()
-	defer putBuf(stdout)
-	cmd.Stdout = stdout
-	cmd.Stderr = stdout
+	// Use *os.File-backed temp files instead of bytes.Buffer. With a
+	// non-*os.File writer Go's exec package creates an internal pipe and
+	// blocks cmd.Wait() until the read-side sees EOF. When runsc daemonizes
+	// a sandbox child, the sandbox inherits the pipe's write end, EOF never
+	// arrives, and the shim's TaskService.Create stalls.
+	stdoutFile, err := os.CreateTemp("", "runsc-stdout-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	defer os.Remove(stdoutFile.Name())
+	defer stdoutFile.Close()
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stdoutFile
 
-	var stderr *bytes.Buffer
+	var stderrFile *os.File
 	if !combined {
-		stderr = getBuf()
-		defer putBuf(stderr)
-		cmd.Stderr = stderr
+		stderrFile, err = os.CreateTemp("", "runsc-stderr-*")
+		if err != nil {
+			return nil, nil, err
+		}
+		defer os.Remove(stderrFile.Name())
+		defer stderrFile.Close()
+		cmd.Stderr = stderrFile
 	}
 	ec, err := Monitor.Start(cmd)
 	if err != nil {
@@ -793,17 +806,26 @@ func cmdOutput(cmd *exec.Cmd, combined bool) ([]byte, []byte, error) {
 	if err == nil && status != 0 {
 		err = fmt.Errorf("%q did not terminate successfully", cmd.Args[0])
 	}
-	// The buffers go back to the pool on return, so copy their contents out.
-	if stderr == nil {
-		return cloneBuf(stdout), nil, err
+
+	stdoutBytes, rerr := readTempFile(stdoutFile)
+	if rerr != nil {
+		err = errors.Join(err, fmt.Errorf("reading runsc output: %w", rerr))
 	}
-	return cloneBuf(stdout), cloneBuf(stderr), err
+	if stderrFile == nil {
+		return stdoutBytes, nil, err
+	}
+	stderrBytes, rerr := readTempFile(stderrFile)
+	if rerr != nil {
+		err = errors.Join(err, fmt.Errorf("reading runsc stderr: %w", rerr))
+	}
+	return stdoutBytes, stderrBytes, err
 }
 
-// cloneBuf returns a copy of b's contents that does not alias b.
-func cloneBuf(b *bytes.Buffer) []byte {
-	if b == nil {
-		return nil
+// readTempFile returns the whole content of f, which the child process wrote
+// through its own duplicate of the descriptor.
+func readTempFile(f *os.File) ([]byte, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
 	}
-	return append([]byte(nil), b.Bytes()...)
+	return io.ReadAll(f)
 }
