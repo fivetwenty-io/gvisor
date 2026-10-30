@@ -43,6 +43,16 @@ const (
 
 	// maxLogLine bounds a line of the poller's log.
 	maxLogLine = 4096
+
+	// exitSettle is how long the supervisor waits, after the poller exits,
+	// for Stop or for the container to be reported gone before it logs the
+	// exit. The poller dies with the container, usually just before the shim
+	// learns that the container is stopping. A genuine failure restarts the
+	// poller after at least minBackoff, which is longer.
+	exitSettle = 200 * time.Millisecond
+
+	// goneTimeout bounds the check whether the container is gone.
+	goneTimeout = 5 * time.Second
 )
 
 // ExecFunc runs the relay in the sandbox with extra appended to its arguments
@@ -61,6 +71,21 @@ func RunscExec(runtime *runsccmd.Runsc, id string) ExecFunc {
 			opts = &runsccmd.ExecOpts{IO: fio}
 		}
 		return runtime.Exec(ctx, id, Process(extra...), opts)
+	}
+}
+
+// GoneFunc reports whether the sandbox the poller runs in has stopped, so that
+// the poller's exit is expected. It reports false when it cannot tell.
+type GoneFunc func(ctx context.Context) bool
+
+// RunscGone returns a GoneFunc that asks runsc for the state of container id.
+// A container that runsc cannot report on is not taken to be gone.
+func RunscGone(runtime *runsccmd.Runsc, id string) GoneFunc {
+	return func(ctx context.Context) bool {
+		ctx, cancel := context.WithTimeout(ctx, goneTimeout)
+		defer cancel()
+		c, err := runtime.State(ctx, id)
+		return err == nil && c.Status == "stopped"
 	}
 }
 
@@ -94,9 +119,11 @@ func (f *stderrIO) Set(cmd *exec.Cmd) { cmd.Stderr = f.stderr }
 // exits, and runs the relay once to gate a process start.
 type Supervisor struct {
 	exec ExecFunc
+	gone GoneFunc
 	logf func(format string, args ...any)
 
 	syncTimeout time.Duration
+	exitSettle  time.Duration
 	minBackoff  time.Duration
 	maxBackoff  time.Duration
 	resetAfter  time.Duration
@@ -112,12 +139,15 @@ type Supervisor struct {
 }
 
 // NewSupervisor returns a Supervisor that runs the relay with run and logs
-// with logf.
-func NewSupervisor(run ExecFunc, logf func(format string, args ...any)) *Supervisor {
+// with logf. The poller exits quietly, without a restart, once gone reports
+// that its sandbox has stopped. A nil gone never does.
+func NewSupervisor(run ExecFunc, gone GoneFunc, logf func(format string, args ...any)) *Supervisor {
 	return &Supervisor{
 		exec:        run,
+		gone:        gone,
 		logf:        logf,
 		syncTimeout: syncTimeout,
+		exitSettle:  exitSettle,
 		minBackoff:  minBackoff,
 		maxBackoff:  maxBackoff,
 		resetAfter:  resetAfter,
@@ -182,6 +212,9 @@ func (s *Supervisor) run() {
 			return
 		default:
 		}
+		if s.sandboxGone() {
+			return
+		}
 		if time.Since(begin) >= s.resetAfter {
 			backoff = s.minBackoff
 		}
@@ -196,6 +229,19 @@ func (s *Supervisor) run() {
 		}
 		backoff = min(2*backoff, s.maxBackoff)
 	}
+}
+
+// sandboxGone reports whether the poller's exit is the sandbox stopping, which
+// the shim has not yet reported with Stop. It waits for exitSettle first, as
+// the container may not yet show as stopped, and returns true early when Stop
+// is called.
+func (s *Supervisor) sandboxGone() bool {
+	select {
+	case <-s.stopCh:
+		return true
+	case <-time.After(s.exitSettle):
+	}
+	return s.gone != nil && s.gone(context.Background())
 }
 
 // runOnce runs the poller until it exits, and logs each line of its stderr.

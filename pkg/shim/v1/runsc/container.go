@@ -246,7 +246,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		processes: make(map[string]extension.Process),
 	}
 	if relay {
-		c.relay = sdsrelay.NewSupervisor(sdsrelay.RunscExec(process.Runtime(), conf.ID), log.L.Infof)
+		c.relay = sdsrelay.NewSupervisor(sdsrelay.RunscExec(process.Runtime(), conf.ID), sdsrelay.RunscGone(process.Runtime(), conf.ID), log.L.Infof)
 	}
 	return &c, nil
 }

@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -132,8 +133,9 @@ func (f *fakeExec) killAll() {
 func newSupervisor(t *testing.T, f *fakeExec) (*Supervisor, *logBuffer) {
 	t.Helper()
 	logs := &logBuffer{}
-	s := NewSupervisor(f.exec, logs.logf)
+	s := NewSupervisor(f.exec, nil, logs.logf)
 	s.syncTimeout = 2 * time.Second
+	s.exitSettle = 5 * time.Millisecond
 	s.minBackoff = 10 * time.Millisecond
 	s.maxBackoff = 40 * time.Millisecond
 	s.resetAfter = time.Hour
@@ -145,9 +147,13 @@ func newSupervisor(t *testing.T, f *fakeExec) (*Supervisor, *logBuffer) {
 }
 
 func TestNewSupervisorDefaults(t *testing.T) {
-	s := NewSupervisor(nil, nil)
-	if s.syncTimeout != 10*time.Second || s.minBackoff != time.Second || s.maxBackoff != 5*time.Second || s.resetAfter != time.Minute {
-		t.Errorf("defaults = %v %v %v %v", s.syncTimeout, s.minBackoff, s.maxBackoff, s.resetAfter)
+	s := NewSupervisor(nil, nil, nil)
+	if s.syncTimeout != 10*time.Second || s.minBackoff != time.Second || s.maxBackoff != 5*time.Second || s.resetAfter != time.Minute || s.exitSettle != exitSettle {
+		t.Errorf("defaults = %v %v %v %v %v", s.syncTimeout, s.minBackoff, s.maxBackoff, s.resetAfter, s.exitSettle)
+	}
+	// A genuine failure restarts the poller after the settle delay has passed.
+	if s.exitSettle >= s.minBackoff {
+		t.Errorf("exitSettle %v is not below minBackoff %v", s.exitSettle, s.minBackoff)
 	}
 	// Sync never waits for the poller, and a restart is never slower than a
 	// gated sync is allowed to be.
@@ -395,6 +401,66 @@ func TestSupervisorStopDuringBackoff(t *testing.T) {
 	}
 }
 
+// The poller dies with its sandbox, which can be before the shim calls Stop.
+func TestSupervisorQuietWhenSandboxGone(t *testing.T) {
+	f := &fakeExec{}
+	s, logs := newSupervisor(t, f)
+	var gone atomic.Bool
+	s.gone = func(context.Context) bool { return gone.Load() }
+	s.Start()
+	waitFor(t, "the poller", func() bool { return f.runCount() == 1 })
+	gone.Store(true)
+	f.kill(t, 1)
+	waitFor(t, "the poller to finish", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.finished == 1
+	})
+	time.Sleep(100 * time.Millisecond)
+	if n := f.runCount(); n != 1 {
+		t.Errorf("%d runs after the sandbox stopped, want 1", n)
+	}
+	if strings.Contains(logs.String(), "restarting") {
+		t.Errorf("log = %q after the sandbox stopped", logs.String())
+	}
+}
+
+// Stop arriving just after the poller exits is also quiet.
+func TestSupervisorStopJustAfterPollerExit(t *testing.T) {
+	f := &fakeExec{}
+	s, logs := newSupervisor(t, f)
+	s.exitSettle = time.Hour
+	s.Start()
+	waitFor(t, "the poller", func() bool { return f.runCount() == 1 })
+	f.kill(t, 1)
+	waitFor(t, "the poller to finish", func() bool {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.finished == 1
+	})
+	s.Stop()
+	time.Sleep(100 * time.Millisecond)
+	if n := f.runCount(); n != 1 {
+		t.Errorf("%d runs, want 1", n)
+	}
+	if strings.Contains(logs.String(), "restarting") {
+		t.Errorf("log = %q", logs.String())
+	}
+}
+
+// A poller that fails while its sandbox runs is logged and restarted.
+func TestSupervisorRestartsWhileSandboxRuns(t *testing.T) {
+	f := &fakeExec{}
+	s, logs := newSupervisor(t, f)
+	s.gone = func(context.Context) bool { return false }
+	s.Start()
+	f.kill(t, 1)
+	waitFor(t, "the restart", func() bool { return f.runCount() == 2 })
+	if got := logs.count("SDS relay exited, restarting in"); got != 1 {
+		t.Errorf("%d exit lines, want 1; log = %q", got, logs.String())
+	}
+}
+
 func TestSupervisorForwardsLog(t *testing.T) {
 	long := strings.Repeat("x", 2*maxLogLine)
 	f := &fakeExec{poll: func(run int, stderr *os.File, killed <-chan struct{}) error {
@@ -532,6 +598,42 @@ func TestRunscExecPoller(t *testing.T) {
 	}
 }
 
+func TestRunscGone(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "runsc")
+	body := `#!/bin/sh
+case "$FAKE_RUNSC_STATE" in
+	fail) echo "no such container" >&2; exit 1 ;;
+	garbage) echo "not json" ;;
+	*) echo "{\"id\":\"c1\",\"status\":\"$FAKE_RUNSC_STATE\"}" ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gone := RunscGone(&runsccmd.Runsc{Command: script, Root: "/run/runsc"}, "c1")
+	for _, tc := range []struct {
+		state string
+		want  bool
+	}{
+		{"stopped", true},
+		{"running", false},
+		{"created", false},
+		{"paused", false},
+		{"fail", false},
+		{"garbage", false},
+	} {
+		t.Setenv("FAKE_RUNSC_STATE", tc.state)
+		if got := gone(context.Background()); got != tc.want {
+			t.Errorf("gone with state %q = %v, want %v", tc.state, got, tc.want)
+		}
+	}
+	missing := RunscGone(&runsccmd.Runsc{Command: filepath.Join(dir, "missing")}, "c1")
+	if missing(context.Background()) {
+		t.Error("gone with a missing runsc = true")
+	}
+}
+
 func TestStderrIO(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "stderr")
 	if err != nil {
@@ -597,7 +699,7 @@ func TestSupervisorWithRelay(t *testing.T) {
 		}
 	}
 	logs := &logBuffer{}
-	s := NewSupervisor(run, logs.logf)
+	s := NewSupervisor(run, nil, logs.logf)
 	s.minBackoff = 10 * time.Millisecond
 	t.Cleanup(func() {
 		s.Stop()
