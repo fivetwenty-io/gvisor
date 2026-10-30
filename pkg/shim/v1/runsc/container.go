@@ -16,6 +16,7 @@ package runsc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -37,6 +38,7 @@ import (
 	runc "github.com/containerd/go-runc"
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -77,11 +79,17 @@ type Container struct {
 	// relay keeps the container's copy of Diego's Envoy configuration current.
 	// It is nil when the container has no such configuration.
 	relay relayGate
+
+	// envoyExecs holds the IDs of the execs that read Diego's Envoy
+	// configuration, whose start waits for the relay.
+	//
+	// +checklocks:mu
+	envoyExecs map[string]bool
 }
 
 // relayGate is the part of sdsrelay.Supervisor that a container uses.
 type relayGate interface {
-	Start(ctx context.Context) error
+	Start()
 	Sync(ctx context.Context) error
 	Stop()
 }
@@ -307,6 +315,14 @@ func (c *Container) ProcessRemove(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.processes, id)
+	delete(c.envoyExecs, id)
+}
+
+// readsEnvoyConfig reports whether exec id reads Diego's Envoy configuration.
+func (c *Container) readsEnvoyConfig(id string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.envoyExecs[id]
 }
 
 // Start a container process.
@@ -315,18 +331,21 @@ func (c *Container) Start(ctx context.Context, r *task.StartRequest) (extension.
 	if err != nil {
 		return nil, err
 	}
-	if err := startProcess(ctx, p, r.ExecID == "", c.relay); err != nil {
+	init := r.ExecID == ""
+	if err := startProcess(ctx, p, init, !init && c.readsEnvoyConfig(r.ExecID), c.relay); err != nil {
 		return nil, err
 	}
 	return p, nil
 }
 
-// startProcess starts p. With a relay, an exec starts only once the relay's
-// copies are current, and init's start also starts the relay.
-func startProcess(ctx context.Context, p extension.Process, init bool, relay relayGate) error {
-	if !init && relay != nil {
-		// Envoy runs as an exec, and it must find the current copies of its
-		// configuration when it starts.
+// startProcess starts p. With a relay, an exec that reads Diego's Envoy
+// configuration starts only once the relay's copies are current, and init's
+// start also starts the relay. No other start waits for the relay or fails
+// because of it.
+func startProcess(ctx context.Context, p extension.Process, init, readsEnvoyConfig bool, relay relayGate) error {
+	if readsEnvoyConfig && relay != nil {
+		// Envoy must find the current copies of its configuration when it
+		// starts, and must not start without them.
 		if err := relay.Sync(ctx); err != nil {
 			return fmt.Errorf("sync Envoy configuration: %w", err)
 		}
@@ -336,9 +355,7 @@ func startProcess(ctx context.Context, p extension.Process, init bool, relay rel
 	}
 	if init && relay != nil {
 		// The relay runs as an exec, which needs a running container.
-		if err := relay.Start(ctx); err != nil {
-			return fmt.Errorf("start SDS relay: %w", err)
-		}
+		relay.Start()
 	}
 	return nil
 }
@@ -379,7 +396,32 @@ func (c *Container) Exec(ctx context.Context, r *task.ExecProcessRequest) (exten
 		return nil, err
 	}
 	c.ProcessAdd(p)
+	gated := c.relay != nil && execReadsEnvoyConfig(r.Spec)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if gated {
+		if c.envoyExecs == nil {
+			c.envoyExecs = make(map[string]bool)
+		}
+		c.envoyExecs[r.ExecID] = true
+	} else {
+		delete(c.envoyExecs, r.ExecID)
+	}
 	return p, nil
+}
+
+// execReadsEnvoyConfig reports whether an exec's process spec names Diego's
+// Envoy configuration. A spec that does not decode is treated as Envoy's, so
+// that Envoy never starts without its configuration.
+func execReadsEnvoyConfig(spec *anypb.Any) bool {
+	if spec == nil {
+		return false
+	}
+	var p specs.Process
+	if err := json.Unmarshal(spec.GetValue(), &p); err != nil {
+		return true
+	}
+	return sdsrelay.ReadsEnvoyConfig(p.Args)
 }
 
 // ResizePty of a process
@@ -471,15 +513,13 @@ func (c *Container) Restore(ctx context.Context, r *extension.RestoreRequest) (e
 	if err != nil {
 		return nil, err
 	}
+	if c.relay != nil {
+		// A restored container would run without the relay, and Envoy would
+		// never see a rotated certificate.
+		return nil, fmt.Errorf("restore a container that relays Diego's Envoy configuration: %w", errdefs.ErrNotImplemented)
+	}
 	if err := p.Restore(ctx, &r.Conf); err != nil {
 		return nil, err
-	}
-	if r.Start.ExecID == "" && c.relay != nil {
-		// A restored sandbox holds the checkpointed relay, whose pipes to the
-		// old shim are gone, so a new relay serves this shim.
-		if err := c.relay.Start(ctx); err != nil {
-			return nil, fmt.Errorf("start SDS relay: %w", err)
-		}
 	}
 	// TODO: Set the cgroup and oom notifications on restore.
 	// https://github.com/google/gvisor-containerd-shim/issues/58

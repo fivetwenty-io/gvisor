@@ -22,32 +22,46 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 const (
-	// tmpPrefix names the relay's temporary files in the target. Source files
-	// with this prefix are never copied, and target files with it are removed.
+	// tmpPrefix starts the names of the relays' temporary files in the target.
+	// Each relay adds its pid, so that two relays never remove each other's.
 	tmpPrefix = ".sds-relay-"
+
+	// staleTemp is the age at which a temporary file of another relay is
+	// taken to be left by a relay that died while writing it.
+	staleTemp = time.Minute
 
 	// maxFileSize bounds the size of a file the relay copies.
 	maxFileSize = 16 << 20
 
-	// settleAttempts and settleDelay bound how long a requested sync waits for
-	// a file that is being written to settle.
+	// settleAttempts and settleDelay bound how long a gated sync waits for a
+	// file that is being written to settle.
 	settleAttempts = 20
 	settleDelay    = 50 * time.Millisecond
+
+	// quietTime is how long a source file must go unchanged before the relay
+	// copies it, so that it never copies a file that Diego is still writing.
+	quietTime = 100 * time.Millisecond
+
+	// fullCheckEvery is how many syncs pass between two syncs that compare
+	// every file in full, which catches a rewrite that keeps every attribute
+	// the relay compares.
+	fullCheckEvery = 60
 )
 
 var (
-	// errPending means a file changed while it was read, so the sync must be
-	// repeated.
-	errPending = errors.New("a source file changed while it was read")
+	// errPending means a source file is still being written, so the sync
+	// must be repeated.
+	errPending = errors.New("a source file is still being written")
 
 	// errUnstable is the per-file form of errPending.
-	errUnstable = errors.New("file changed while it was read")
+	errUnstable = errors.New("file is still being written")
 
 	// afterRead, when set by a test, runs after a source file is read and
 	// before it is checked for changes.
@@ -69,10 +83,17 @@ type Relay struct {
 	// settleAttempts and settleDelay override the package defaults in tests.
 	settleAttempts int
 	settleDelay    time.Duration
+	// now overrides time.Now in tests.
+	now func() time.Time
 
 	// lastErr is the last error reported, so that a repeated error is
 	// logged once.
 	lastErr string
+	// copied holds, for each file the relay knows to be current, the
+	// attributes of the source and of the copy at that time.
+	copied map[string]copiedFile
+	// syncs counts the calls to Sync.
+	syncs int
 }
 
 // fileState is the content and attributes the relay mirrors for one file.
@@ -87,10 +108,45 @@ func (f *fileState) equal(o *fileState) bool {
 	return f.perm == o.perm && f.uid == o.uid && f.gid == o.gid && bytes.Equal(f.data, o.data)
 }
 
+// fileKey holds the attributes that change whenever a file is replaced or
+// written, so that a file whose key is unchanged needs no read.
+type fileKey struct {
+	dev, ino     uint64
+	size         int64
+	mtime, ctime int64
+	mode         uint32
+	uid, gid     uint32
+}
+
+func keyOf(info os.FileInfo) fileKey {
+	st := info.Sys().(*syscall.Stat_t)
+	return fileKey{
+		dev:   uint64(st.Dev),
+		ino:   st.Ino,
+		size:  st.Size,
+		mtime: st.Mtim.Nano(),
+		ctime: st.Ctim.Nano(),
+		mode:  st.Mode,
+		uid:   st.Uid,
+		gid:   st.Gid,
+	}
+}
+
+type copiedFile struct {
+	source, target fileKey
+}
+
 func (r *Relay) logf(format string, args ...any) {
 	if r.Logf != nil {
 		r.Logf(format, args...)
 	}
+}
+
+func (r *Relay) clock() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 // report logs err when it differs from the last error, and logs a recovery
@@ -111,10 +167,22 @@ func (r *Relay) report(err error) {
 	r.lastErr = msg
 }
 
+// skipped reports whether the relay ignores a source file. Diego writes each
+// SDS file to NAME.tmp before it renames it into place, and the relay's own
+// temporary files start with a dot.
+func skipped(name string) bool {
+	return strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".tmp")
+}
+
+// ownTmpPrefix starts the names of this relay's temporary files.
+func ownTmpPrefix() string {
+	return tmpPrefix + strconv.Itoa(os.Getpid()) + "-"
+}
+
 // Sync mirrors Source into Target once. A file that Source no longer lists is
 // removed from Target, but Target is left as it is when Source cannot be read.
-// Sync returns an error wrapping errPending when a file changed while it was
-// read, and the caller should then sync again.
+// Sync returns an error wrapping errPending when a file is still being
+// written, and the caller should then sync again.
 func (r *Relay) Sync() error {
 	info, err := os.Stat(r.Source)
 	if err != nil {
@@ -127,6 +195,13 @@ func (r *Relay) Sync() error {
 	if err != nil {
 		return fmt.Errorf("listing source directory: %w", err)
 	}
+	if r.syncs%fullCheckEvery == 0 {
+		r.copied = nil
+	}
+	r.syncs++
+	if r.copied == nil {
+		r.copied = make(map[string]copiedFile)
+	}
 
 	var (
 		errs    []error
@@ -135,7 +210,7 @@ func (r *Relay) Sync() error {
 	listed := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		name := e.Name()
-		if strings.HasPrefix(name, tmpPrefix) {
+		if skipped(name) {
 			continue
 		}
 		listed[name] = true
@@ -146,27 +221,20 @@ func (r *Relay) Sync() error {
 		switch {
 		case err == nil:
 		case errors.Is(err, errUnstable), errors.Is(err, os.ErrNotExist):
-			// The file is being replaced; the next sync copies its successor.
+			// The file is being written or replaced; a later sync copies it.
 			pending = append(pending, name)
 		default:
 			errs = append(errs, err)
 		}
 	}
-
-	targets, err := os.ReadDir(r.Target)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("listing target directory: %w", err))
+	for name := range r.copied {
+		if !listed[name] {
+			delete(r.copied, name)
+		}
 	}
-	for _, e := range targets {
-		name := e.Name()
-		if listed[name] || !e.Type().IsRegular() {
-			continue
-		}
-		// Either the source removed the file, or this is a temporary file left
-		// by a relay that died while writing it.
-		if err := os.Remove(filepath.Join(r.Target, name)); err != nil && !os.IsNotExist(err) {
-			errs = append(errs, fmt.Errorf("removing %q: %w", name, err))
-		}
+
+	if err := r.removeUnlisted(listed); err != nil {
+		errs = append(errs, err)
 	}
 
 	// The target directory takes the group and other bits of the source
@@ -187,6 +255,34 @@ func (r *Relay) Sync() error {
 	return errors.Join(errs...)
 }
 
+// removeUnlisted removes the regular files in Target that Source does not
+// list. It leaves the temporary files of other relays alone until they are
+// stale, so that it never removes one between its write and its rename.
+func (r *Relay) removeUnlisted(listed map[string]bool) error {
+	targets, err := os.ReadDir(r.Target)
+	if err != nil {
+		return fmt.Errorf("listing target directory: %w", err)
+	}
+	var errs []error
+	own := ownTmpPrefix()
+	for _, e := range targets {
+		name := e.Name()
+		if listed[name] || !e.Type().IsRegular() {
+			continue
+		}
+		if strings.HasPrefix(name, tmpPrefix) && !strings.HasPrefix(name, own) {
+			info, err := e.Info()
+			if err != nil || r.clock().Sub(info.ModTime()) < staleTemp {
+				continue
+			}
+		}
+		if err := os.Remove(filepath.Join(r.Target, name)); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("removing %q: %w", name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // syncSettled syncs until no file is pending, within the settle bound.
 func (r *Relay) syncSettled() error {
 	attempts, delay := r.settleAttempts, r.settleDelay
@@ -203,98 +299,114 @@ func (r *Relay) syncSettled() error {
 	return err
 }
 
-// syncFile copies Source/name to Target/name unless the copy is current.
+// syncFile copies Source/name to Target/name unless the copy is current. A
+// file whose source and copy both keep the attributes they had when the relay
+// last found the copy current is not read again.
 func (r *Relay) syncFile(name string) error {
-	want, err := readStable(filepath.Join(r.Source, name))
+	src, dst := filepath.Join(r.Source, name), filepath.Join(r.Target, name)
+	sinfo, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
-	have, err := readTarget(filepath.Join(r.Target, name))
+	if c, ok := r.copied[name]; ok && c.source == keyOf(sinfo) {
+		if tinfo, err := os.Lstat(dst); err == nil && keyOf(tinfo) == c.target {
+			return nil
+		}
+	}
+	delete(r.copied, name)
+
+	want, skey, err := r.readStable(src)
 	if err != nil {
 		return err
 	}
-	if have != nil && have.equal(want) {
-		return nil
+	have := readTarget(dst)
+	if len(want.data) == 0 && have != nil && len(have.data) > 0 {
+		// Diego writes envoy.yaml in place, so an empty file is one it has
+		// truncated and not yet written.
+		return fmt.Errorf("%q is empty: %w", name, errUnstable)
 	}
-	return r.write(name, want)
+	if have == nil || !have.equal(want) {
+		if err := r.write(name, want); err != nil {
+			return err
+		}
+	}
+	tinfo, err := os.Lstat(dst)
+	if err != nil {
+		return err
+	}
+	r.copied[name] = copiedFile{source: skey, target: keyOf(tinfo)}
+	return nil
 }
 
-// readStable reads a regular file and its attributes. It fails with
-// errUnstable when the file was replaced or changed while it was read.
-func readStable(path string) (*fileState, error) {
-	before, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !before.Mode().IsRegular() {
-		return nil, fmt.Errorf("%q is not a regular file", filepath.Base(path))
-	}
+// readStable reads a regular file and its attributes without following a
+// symbolic link. It fails with errUnstable when the file was replaced or
+// changed while it was read, or changed less than quietTime ago.
+func (r *Relay) readStable(path string) (*fileState, fileKey, error) {
+	name := filepath.Base(path)
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, err
+		return nil, fileKey{}, err
 	}
 	defer f.Close()
 	opened, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fileKey{}, err
 	}
-	if !os.SameFile(before, opened) {
-		return nil, fmt.Errorf("%q: %w", filepath.Base(path), errUnstable)
+	if !opened.Mode().IsRegular() {
+		return nil, fileKey{}, fmt.Errorf("%q is not a regular file", name)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, maxFileSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading %q: %w", filepath.Base(path), err)
+		return nil, fileKey{}, fmt.Errorf("reading %q: %w", name, err)
 	}
 	if len(data) > maxFileSize {
-		return nil, fmt.Errorf("%q is larger than %d bytes", filepath.Base(path), maxFileSize)
+		return nil, fileKey{}, fmt.Errorf("%q is larger than %d bytes", name, maxFileSize)
 	}
 	if afterRead != nil {
 		afterRead(path)
 	}
 	after, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, fileKey{}, err
 	}
-	if after.Size() != int64(len(data)) || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
-		return nil, fmt.Errorf("%q: %w", filepath.Base(path), errUnstable)
+	key := keyOf(after)
+	if key != keyOf(opened) || key.size != int64(len(data)) {
+		return nil, fileKey{}, fmt.Errorf("%q: %w", name, errUnstable)
 	}
-	if now, err := os.Lstat(path); err != nil || !os.SameFile(now, opened) {
-		return nil, fmt.Errorf("%q: %w", filepath.Base(path), errUnstable)
+	if now, err := os.Lstat(path); err != nil || !os.SameFile(now, after) {
+		return nil, fileKey{}, fmt.Errorf("%q: %w", name, errUnstable)
 	}
-	st := opened.Sys().(*syscall.Stat_t)
-	return &fileState{data: data, perm: opened.Mode().Perm(), uid: st.Uid, gid: st.Gid}, nil
+	if age := r.clock().Sub(time.Unix(0, key.ctime)); age >= 0 && age < quietTime {
+		return nil, fileKey{}, fmt.Errorf("%q: %w", name, errUnstable)
+	}
+	return &fileState{data: data, perm: after.Mode().Perm(), uid: key.uid, gid: key.gid}, key, nil
 }
 
-// readTarget reads a copy in Target. It returns nil when there is no regular
-// file at path, so that the copy is written.
-func readTarget(path string) (*fileState, error) {
-	info, err := os.Lstat(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+// readTarget reads a copy in Target without following a symbolic link or
+// blocking on a FIFO. It returns nil when there is no regular file at path
+// that it can read, so that the copy is written.
+func readTarget(path string) *fileState {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, nil
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, err
+		return nil
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
 	data, err := io.ReadAll(io.LimitReader(f, maxFileSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading copy of %q: %w", filepath.Base(path), err)
+		return nil
 	}
 	st := info.Sys().(*syscall.Stat_t)
-	return &fileState{data: data, perm: info.Mode().Perm(), uid: st.Uid, gid: st.Gid}, nil
+	return &fileState{data: data, perm: info.Mode().Perm(), uid: st.Uid, gid: st.Gid}
 }
 
 // write replaces Target/name with want through a temporary file and a rename,
 // so that a reader never sees a partial copy and the Sentry raises IN_MOVED_TO.
 func (r *Relay) write(name string, want *fileState) (err error) {
-	tmp, err := os.CreateTemp(r.Target, tmpPrefix+"*")
+	tmp, err := os.CreateTemp(r.Target, ownTmpPrefix()+"*")
 	if err != nil {
 		return fmt.Errorf("creating copy of %q: %w", name, err)
 	}
@@ -324,7 +436,16 @@ func (r *Relay) write(name string, want *fileState) (err error) {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing copy of %q: %w", name, err)
 	}
-	if err := os.Rename(tmp.Name(), filepath.Join(r.Target, name)); err != nil {
+	dst := filepath.Join(r.Target, name)
+	err = os.Rename(tmp.Name(), dst)
+	if errors.Is(err, syscall.EEXIST) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENOTEMPTY) {
+		// A directory holds the name, which a rename cannot replace.
+		// RemoveAll never follows a symbolic link.
+		if err = os.RemoveAll(dst); err == nil {
+			err = os.Rename(tmp.Name(), dst)
+		}
+	}
+	if err != nil {
 		return fmt.Errorf("renaming copy of %q: %w", name, err)
 	}
 	r.logf("updated %q", name)

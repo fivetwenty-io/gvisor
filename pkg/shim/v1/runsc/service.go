@@ -802,6 +802,9 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	return p, relay, nil
 }
 
+// executable returns the path of the shim's own binary. Tests replace it.
+var executable = os.Executable
+
 // setSDSRelay rewrites a sandbox's spec so that the SDS relay can mirror
 // Diego's Envoy configuration into it. It returns true when the container
 // needs the relay.
@@ -813,7 +816,7 @@ func setSDSRelay(spec *specs.Spec) (bool, error) {
 		return false, nil
 	}
 	// RewriteSpec needs the binary only when it rewrites the spec.
-	binary, exeErr := os.Executable()
+	binary, exeErr := executable()
 	relay, err := sdsrelay.RewriteSpec(spec, binary)
 	if err != nil {
 		if exeErr != nil {

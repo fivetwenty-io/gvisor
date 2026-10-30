@@ -194,4 +194,38 @@ func TestProcess(t *testing.T) {
 	if !reflect.DeepEqual(p.Env, []string{"GOMAXPROCS=1"}) {
 		t.Errorf("env = %v", p.Env)
 	}
+
+	// Extra arguments follow the fixed ones, and never change a later
+	// process's arguments or environment.
+	once := Process(OnceFlag)
+	if want := []string{BinaryPath, Subcommand, "--source", SourcePath, "--target", EnvoyConfigPath, "--once"}; !reflect.DeepEqual(once.Args, want) {
+		t.Errorf("args = %v, want %v", once.Args, want)
+	}
+	once.Env[0] = "changed"
+	if p := Process(); len(p.Args) != 6 || p.Env[0] != "GOMAXPROCS=1" {
+		t.Errorf("Process() = %v %v after a change to an earlier result", p.Args, p.Env)
+	}
+}
+
+func TestReadsEnvoyConfig(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		// Diego's Envoy command.
+		{[]string{"sh", "-c", "trap 'kill -9 0' TERM; /etc/cf-assets/envoy/envoy -c /etc/cf-assets/envoy_config/envoy.yaml --drain-time-s 900 --log-level critical& pid=$!; wait $pid"}, true},
+		{[]string{"/etc/cf-assets/envoy/envoy", "-c", "/etc/cf-assets/envoy_config/envoy.yaml"}, true},
+		{[]string{"cat", "/etc/cf-assets/envoy_config"}, true},
+		// The app, health checks, sshd, and Garden's streams.
+		{[]string{"/tmp/lifecycle/launcher", "app", "bundle exec rackup", ""}, false},
+		{[]string{"/etc/cf-assets/healthcheck/healthcheck", "-port=8080", "-timeout=1000ms"}, false},
+		{[]string{"/tmp/lifecycle/diego-sshd", "--allowedKeyExchanges=", "--address=0.0.0.0:2222"}, false},
+		{[]string{"tar", "-x", "-C", "/home/vcap"}, false},
+		{[]string{"/etc/cf-assets/envoy/envoy", "--version"}, false},
+		{nil, false},
+	} {
+		if got := ReadsEnvoyConfig(tc.args); got != tc.want {
+			t.Errorf("ReadsEnvoyConfig(%q) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
 }

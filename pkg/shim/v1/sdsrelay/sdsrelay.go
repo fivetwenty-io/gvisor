@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
@@ -55,12 +56,19 @@ const (
 // gets no other capability.
 var relayCapabilities = []string{"CAP_CHOWN", "CAP_DAC_READ_SEARCH"}
 
+// relayEnv keeps the relay to one thread that runs Go code. The relay runs in
+// the app's sandbox and counts against the app's memory limit. Its heap holds
+// only a few small files, so GOGC and GOMEMLIMIT do not make it smaller: with
+// GOGC=25 and GOMEMLIMIT=4MiB, a relay in a gVisor sandbox took 1.2 MB more
+// than with GOMAXPROCS=1 alone.
+var relayEnv = []string{"GOMAXPROCS=1"}
+
 // Process returns the process the shim executes in the sandbox to run the
-// relay.
-func Process() specs.Process {
+// relay, with extra appended to its arguments.
+func Process(extra ...string) specs.Process {
 	return specs.Process{
-		Args: []string{BinaryPath, Subcommand, "--source", SourcePath, "--target", EnvoyConfigPath},
-		Env:  []string{"GOMAXPROCS=1"},
+		Args: append([]string{BinaryPath, Subcommand, "--source", SourcePath, "--target", EnvoyConfigPath}, extra...),
+		Env:  slices.Clone(relayEnv),
 		Cwd:  "/",
 		User: specs.User{UID: 0, GID: 0},
 		Capabilities: &specs.LinuxCapabilities{
@@ -70,6 +78,18 @@ func Process() specs.Process {
 		},
 		NoNewPrivileges: true,
 	}
+}
+
+// ReadsEnvoyConfig reports whether a process with args reads Diego's Envoy
+// configuration. Diego always starts Envoy with the path of its bootstrap in
+// that directory, and no other process Diego starts names it.
+func ReadsEnvoyConfig(args []string) bool {
+	for _, a := range args {
+		if strings.Contains(a, EnvoyConfigPath) {
+			return true
+		}
+	}
+	return false
 }
 
 // HasEnvoyConfigMount reports whether spec bind-mounts Diego's Envoy

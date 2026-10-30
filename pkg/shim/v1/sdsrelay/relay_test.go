@@ -41,6 +41,9 @@ func newRelay(t *testing.T) (*Relay, *bytes.Buffer) {
 		Target:         filepath.Join(dir, "target"),
 		settleAttempts: 3,
 		settleDelay:    time.Millisecond,
+		// Every file is past its quiet time, and every temporary file left
+		// in the target is stale.
+		now: func() time.Time { return time.Now().Add(time.Hour) },
 	}
 	for _, d := range []string{r.Source, r.Target} {
 		if err := os.Mkdir(d, 0o755); err != nil {
@@ -435,7 +438,8 @@ func TestSyncRemovesVanishedFiles(t *testing.T) {
 func TestSyncCleansUpTemporaryFiles(t *testing.T) {
 	r, _ := newRelay(t)
 	// A relay that died while it wrote a copy leaves its temporary file.
-	writeFile(t, filepath.Join(r.Target, tmpPrefix+"123"), "partial", 0o600)
+	writeFile(t, filepath.Join(r.Target, tmpPrefix+"123-456"), "partial", 0o600)
+	writeFile(t, filepath.Join(r.Target, ownTmpPrefix()+"789"), "partial", 0o600)
 	// Source files with the reserved prefix are never copied.
 	writeFile(t, filepath.Join(r.Source, tmpPrefix+"456"), "x", 0o644)
 	writeFile(t, filepath.Join(r.Source, "envoy.yaml"), "admin: {}\n", 0o644)
@@ -444,6 +448,224 @@ func TestSyncCleansUpTemporaryFiles(t *testing.T) {
 	}
 	if n := names(t, r.Target); fmt.Sprint(n) != "[envoy.yaml]" {
 		t.Errorf("target holds %v, want [envoy.yaml]", n)
+	}
+}
+
+// TestSyncLeavesOtherRelaysTemporaryFiles runs two relays at once, as the
+// poller and a gated sync do, and checks that neither removes a temporary
+// file the other is still writing.
+func TestSyncLeavesOtherRelaysTemporaryFiles(t *testing.T) {
+	r, _ := newRelay(t)
+	now := time.Now()
+	writeFile(t, filepath.Join(r.Source, "envoy.yaml"), "admin: {}\n", 0o644)
+	// One second later, envoy.yaml is quiet, and a temporary file written now
+	// is not yet stale.
+	r.now = func() time.Time { return now.Add(time.Second) }
+
+	other := filepath.Join(r.Target, tmpPrefix+"1-123")
+	stale := filepath.Join(r.Target, tmpPrefix+"2-123")
+	mine := filepath.Join(r.Target, ownTmpPrefix()+"123")
+	for _, p := range []string{other, stale, mine} {
+		writeFile(t, p, "partial", 0o600)
+	}
+	if err := os.Chtimes(other, now, now); err != nil {
+		t.Fatal(err)
+	}
+	// stale is exactly staleTemp old.
+	staleTime := now.Add(time.Second - staleTemp)
+	if err := os.Chtimes(stale, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n, want := names(t, r.Target), []string{filepath.Base(other), "envoy.yaml"}; fmt.Sprint(n) != fmt.Sprint(want) {
+		t.Errorf("target holds %v, want %v", n, want)
+	}
+	if staleTemp != time.Minute {
+		t.Errorf("staleTemp = %v, want 1m", staleTemp)
+	}
+}
+
+// TestSyncSkipsDiegoTemporaryFiles covers Diego's NAME.tmp, which it writes
+// before it renames it over NAME.
+func TestSyncSkipsDiegoTemporaryFiles(t *testing.T) {
+	r, _ := newRelay(t)
+	writeFile(t, filepath.Join(r.Source, "sds-id-cert-and-key.yaml"), "serial: 1\n", 0o644)
+	writeFile(t, filepath.Join(r.Source, "sds-id-cert-and-key.yaml.tmp"), "seri", 0o644)
+	writeFile(t, filepath.Join(r.Source, ".hidden"), "x", 0o644)
+	// A copy of such a file, left by an older relay, is removed.
+	writeFile(t, filepath.Join(r.Target, "envoy.yaml.tmp"), "x", 0o644)
+	events := watch(t, r.Target)
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if n := names(t, r.Target); fmt.Sprint(n) != "[sds-id-cert-and-key.yaml]" {
+		t.Errorf("target holds %v, want [sds-id-cert-and-key.yaml]", n)
+	}
+	got := events()
+	if final := finalEvents(got, "sds-id-cert-and-key.yaml.tmp", ".hidden"); len(final) != 0 {
+		t.Errorf("events on skipped files: %v", final)
+	}
+}
+
+func TestSkipped(t *testing.T) {
+	for name, want := range map[string]bool{
+		"envoy.yaml":                   false,
+		"sds-id-cert-and-key.yaml":     false,
+		"sds-id-cert-and-key.yaml.tmp": true,
+		".sds-relay-1-2":               true,
+		".x":                           true,
+		"tmp":                          false,
+		"x.tmpl":                       false,
+	} {
+		if got := skipped(name); got != want {
+			t.Errorf("skipped(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestSyncKeepsCopyOfTruncatedFile covers Diego's in-place write of
+// envoy.yaml, which truncates the file before it writes it.
+func TestSyncKeepsCopyOfTruncatedFile(t *testing.T) {
+	r, _ := newRelay(t)
+	path := filepath.Join(r.Source, "envoy.yaml")
+	writeFile(t, path, "admin: {}\n", 0o644)
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, path, "", 0o644)
+	if err := r.Sync(); !errors.Is(err, errPending) || !strings.Contains(err.Error(), "envoy.yaml") {
+		t.Errorf("Sync of an empty file = %v, want errPending", err)
+	}
+	if got := readFile(t, filepath.Join(r.Target, "envoy.yaml")); got != "admin: {}\n" {
+		t.Errorf("copy = %q, want the previous copy", got)
+	}
+	writeFile(t, path, "admin: []\n", 0o644)
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, filepath.Join(r.Target, "envoy.yaml")); got != "admin: []\n" {
+		t.Errorf("copy = %q", got)
+	}
+
+	// An empty file with no copy, or with an empty copy, is copied. The
+	// second sync compares the files in full.
+	writeFile(t, filepath.Join(r.Source, "empty"), "", 0o644)
+	for i := 0; i < 2; i++ {
+		r.copied = nil
+		if err := r.Sync(); err != nil {
+			t.Fatalf("Sync %d: %v", i, err)
+		}
+	}
+	if got := readFile(t, filepath.Join(r.Target, "empty")); got != "" {
+		t.Errorf("copy of the empty file = %q", got)
+	}
+}
+
+// TestSyncWaitsForQuietFiles checks that a file changed less than quietTime
+// ago is not copied, so that a write in progress is never copied.
+func TestSyncWaitsForQuietFiles(t *testing.T) {
+	r, _ := newRelay(t)
+	path := filepath.Join(r.Source, "envoy.yaml")
+	writeFile(t, path, "admin: {}\n", 0o644)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := time.Unix(0, keyOf(info).ctime)
+	for _, tc := range []struct {
+		age     time.Duration
+		pending bool
+	}{
+		{0, true},
+		{quietTime - time.Nanosecond, true},
+		{-time.Second, false}, // A clock behind the file's time does not hold it.
+		{quietTime, false},
+	} {
+		r.copied = nil
+		os.Remove(filepath.Join(r.Target, "envoy.yaml"))
+		r.now = func() time.Time { return changed.Add(tc.age) }
+		err := r.Sync()
+		if got := errors.Is(err, errPending); got != tc.pending {
+			t.Errorf("age %v: Sync = %v, want pending %v", tc.age, err, tc.pending)
+		}
+		if _, err := os.Stat(filepath.Join(r.Target, "envoy.yaml")); os.IsNotExist(err) != tc.pending {
+			t.Errorf("age %v: copied = %v, want %v", tc.age, err == nil, !tc.pending)
+		}
+	}
+	if quietTime != 100*time.Millisecond {
+		t.Errorf("quietTime = %v, want 100ms", quietTime)
+	}
+}
+
+// TestSyncReadsOnlyChangedFiles checks that a file whose source and copy keep
+// their attributes is not read again, except in a full check.
+func TestSyncReadsOnlyChangedFiles(t *testing.T) {
+	r, _ := newRelay(t)
+	path := filepath.Join(r.Source, "envoy.yaml")
+	target := filepath.Join(r.Target, "envoy.yaml")
+	writeFile(t, path, "admin: {}\n", 0o644)
+	reads := 0
+	afterRead = func(string) { reads++ }
+	defer func() { afterRead = nil }()
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 1 {
+		t.Errorf("read %d times, want 1", reads)
+	}
+
+	// A copy changed in the target is read and replaced at once.
+	writeFile(t, target, "admin: [] \n", 0o644)
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, target); got != "admin: {}\n" {
+		t.Errorf("copy = %q after it was changed", got)
+	}
+	if reads != 2 {
+		t.Errorf("read %d times, want 2", reads)
+	}
+
+	// A change that keeps every attribute the relay compares, made here by
+	// recording the changed copy as current, is caught by the next full check.
+	writeFile(t, target, "admin: [] \n", 0o644)
+	tinfo, err := os.Lstat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := r.copied["envoy.yaml"]
+	c.target = keyOf(tinfo)
+	r.copied["envoy.yaml"] = c
+	for r.syncs%fullCheckEvery != 0 {
+		if err := r.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if got := readFile(t, target); got != "admin: [] \n" {
+			t.Fatalf("copy was replaced %d syncs before the full check", fullCheckEvery-r.syncs%fullCheckEvery)
+		}
+	}
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readFile(t, target); got != "admin: {}\n" {
+		t.Errorf("copy = %q after the full check", got)
+	}
+	if fullCheckEvery != 60 {
+		t.Errorf("fullCheckEvery = %d, want 60", fullCheckEvery)
+	}
+
+	// A file that leaves the source is forgotten.
+	os.Remove(path)
+	if err := r.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.copied) != 0 {
+		t.Errorf("relay still tracks %v", r.copied)
 	}
 }
 
@@ -473,21 +695,78 @@ func TestSyncSkipsOtherFileTypes(t *testing.T) {
 	}
 }
 
+// TestSyncReplacesNonRegularTarget puts what root in the container could put
+// at a copy's name, and checks that the relay replaces it without following a
+// link, blocking on a FIFO, or failing.
 func TestSyncReplacesNonRegularTarget(t *testing.T) {
-	r, _ := newRelay(t)
-	writeFile(t, filepath.Join(r.Source, "envoy.yaml"), "admin: {}\n", 0o644)
-	if err := os.Symlink("/nonexistent", filepath.Join(r.Target, "envoy.yaml")); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Lstat(filepath.Join(r.Target, "envoy.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.Mode().IsRegular() {
-		t.Errorf("copy is %v, want a regular file", info.Mode())
+	outside := filepath.Join(t.TempDir(), "outside")
+	for _, tc := range []struct {
+		name string
+		make func(t *testing.T, path string)
+	}{
+		{"dangling symlink", func(t *testing.T, path string) {
+			if err := os.Symlink("/nonexistent", path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink to a file", func(t *testing.T, path string) {
+			writeFile(t, outside, "outside\n", 0o644)
+			if err := os.Symlink(outside, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink to a directory", func(t *testing.T, path string) {
+			dir := t.TempDir()
+			writeFile(t, filepath.Join(dir, "keep"), "keep\n", 0o644)
+			if err := os.Symlink(dir, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"fifo", func(t *testing.T, path string) {
+			if err := unix.Mkfifo(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"empty directory", func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"directory", func(t *testing.T, path string) {
+			if err := os.MkdirAll(filepath.Join(path, "sub"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			writeFile(t, filepath.Join(path, "sub", "x"), "x", 0o644)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, _ := newRelay(t)
+			writeFile(t, filepath.Join(r.Source, "envoy.yaml"), "admin: {}\n", 0o644)
+			tc.make(t, filepath.Join(r.Target, "envoy.yaml"))
+			done := make(chan error, 1)
+			go func() { done <- r.Sync() }()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("Sync blocked")
+			}
+			info, err := os.Lstat(filepath.Join(r.Target, "envoy.yaml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.Mode().IsRegular() {
+				t.Errorf("copy is %v, want a regular file", info.Mode())
+			}
+			if got := readFile(t, filepath.Join(r.Target, "envoy.yaml")); got != "admin: {}\n" {
+				t.Errorf("copy = %q", got)
+			}
+			if data, err := os.ReadFile(outside); err == nil && string(data) != "outside\n" {
+				t.Errorf("the link's target was changed to %q", data)
+			}
+		})
 	}
 }
 
@@ -515,6 +794,8 @@ func TestSyncRefusesLargeFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This sync compares the files in full.
+	r.copied = nil
 	if err := r.Sync(); err != nil {
 		t.Fatal(err)
 	}
@@ -717,20 +998,16 @@ func TestWriteFailsWithoutTarget(t *testing.T) {
 	}
 }
 
-func TestWriteFailsOnDirectoryInTheWay(t *testing.T) {
+func TestWriteFailsWhenRenameFails(t *testing.T) {
 	r, _ := newRelay(t)
-	if err := os.Mkdir(filepath.Join(r.Target, "envoy.yaml"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(r.Target, "envoy.yaml", "x"), nil, 0o644); err != nil {
-		t.Fatal(err)
-	}
 	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
-	err := r.write("envoy.yaml", &fileState{data: []byte("x"), perm: 0o644, uid: uid, gid: gid})
-	if err == nil || !strings.Contains(err.Error(), `renaming copy of "envoy.yaml"`) {
+	// The rename fails because the directory that would hold the copy is
+	// missing, which removing the name cannot fix.
+	err := r.write("missing/envoy.yaml", &fileState{data: []byte("x"), perm: 0o644, uid: uid, gid: gid})
+	if err == nil || !strings.Contains(err.Error(), `renaming copy of "missing/envoy.yaml"`) {
 		t.Errorf("write = %v", err)
 	}
-	if n := names(t, r.Target); fmt.Sprint(n) != "[envoy.yaml]" {
+	if n := names(t, r.Target); len(n) != 0 {
 		t.Errorf("target holds %v after a failed write", n)
 	}
 }

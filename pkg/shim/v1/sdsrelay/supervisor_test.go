@@ -17,101 +17,21 @@ package sdsrelay
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 )
-
-// fakeRelay speaks the relay's protocol from inside the test.
-type fakeRelay struct {
-	// ready makes a run announce readiness.
-	ready func(run int) bool
-	// answer returns the lines a run writes for a request.
-	answer func(run int, id string) []string
-	// stderr is written to stderr when a run starts.
-	stderr string
-
-	runs  atomic.Int32
-	mu    sync.Mutex
-	kills []chan struct{}
-	reqs  []string
-}
-
-func (f *fakeRelay) exec(stdin, stdout, stderr *os.File) error {
-	run := int(f.runs.Add(1))
-	kill := make(chan struct{})
-	f.mu.Lock()
-	f.kills = append(f.kills, kill)
-	f.mu.Unlock()
-	defer stdin.Close()
-	defer stdout.Close()
-	defer stderr.Close()
-
-	if f.stderr != "" {
-		fmt.Fprint(stderr, f.stderr)
-	}
-	if f.ready == nil || f.ready(run) {
-		fmt.Fprintln(stdout, readyLine)
-	}
-	lines := make(chan string)
-	go func() {
-		sc := bufio.NewScanner(stdin)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		close(lines)
-	}()
-	for {
-		select {
-		case <-kill:
-			return fmt.Errorf("run %d killed", run)
-		case l, ok := <-lines:
-			if !ok {
-				<-kill
-				return fmt.Errorf("run %d killed", run)
-			}
-			f.mu.Lock()
-			f.reqs = append(f.reqs, l)
-			f.mu.Unlock()
-			id := strings.TrimPrefix(l, syncVerb+" ")
-			replies := []string{okReply + " " + id}
-			if f.answer != nil {
-				replies = f.answer(run, id)
-			}
-			for _, r := range replies {
-				fmt.Fprintln(stdout, r)
-			}
-		}
-	}
-}
-
-// kill ends run n, counted from 1.
-func (f *fakeRelay) kill(t *testing.T, n int) {
-	t.Helper()
-	waitFor(t, fmt.Sprintf("run %d", n), func() bool { return int(f.runs.Load()) >= n })
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	close(f.kills[n-1])
-}
-
-func (f *fakeRelay) killAll() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, k := range f.kills {
-		select {
-		case <-k:
-		default:
-			close(k)
-		}
-	}
-}
 
 type logBuffer struct {
 	mu    sync.Mutex
@@ -130,507 +50,510 @@ func (l *logBuffer) String() string {
 	return strings.Join(l.lines, "\n")
 }
 
-func newSupervisor(t *testing.T, run ExecFunc) (*Supervisor, *logBuffer) {
+func (l *logBuffer) count(substr string) int {
+	return strings.Count(l.String(), substr)
+}
+
+// fakeExec stands in for runsc exec. Gated syncs call once. Poller runs call
+// poll with their number, counted from 1, and a channel that kill closes.
+type fakeExec struct {
+	once func(ctx context.Context) error
+	poll func(run int, stderr *os.File, killed <-chan struct{}) error
+
+	mu       sync.Mutex
+	syncs    [][]string
+	runs     int
+	kills    []chan struct{}
+	finished int
+}
+
+func (f *fakeExec) exec(ctx context.Context, extra []string, stderr *os.File) error {
+	if stderr == nil {
+		f.mu.Lock()
+		f.syncs = append(f.syncs, slices.Clone(extra))
+		f.mu.Unlock()
+		if f.once == nil {
+			return nil
+		}
+		return f.once(ctx)
+	}
+	defer stderr.Close()
+	if len(extra) != 0 {
+		return fmt.Errorf("poller run with %q", extra)
+	}
+	if ctx.Done() != nil {
+		return errors.New("poller run under a context that can end")
+	}
+	kill := make(chan struct{})
+	f.mu.Lock()
+	f.runs++
+	run := f.runs
+	f.kills = append(f.kills, kill)
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.finished++
+		f.mu.Unlock()
+	}()
+	if f.poll != nil {
+		return f.poll(run, stderr, kill)
+	}
+	<-kill
+	return fmt.Errorf("run %d killed", run)
+}
+
+func (f *fakeExec) runCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runs
+}
+
+// kill ends poller run n, counted from 1.
+func (f *fakeExec) kill(t *testing.T, n int) {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("run %d", n), func() bool { return f.runCount() >= n })
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	close(f.kills[n-1])
+}
+
+func (f *fakeExec) killAll() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.kills {
+		select {
+		case <-k:
+		default:
+			close(k)
+		}
+	}
+}
+
+func newSupervisor(t *testing.T, f *fakeExec) (*Supervisor, *logBuffer) {
 	t.Helper()
 	logs := &logBuffer{}
-	s := NewSupervisor(run, logs.logf)
-	s.readyTimeout = 2 * time.Second
+	s := NewSupervisor(f.exec, logs.logf)
 	s.syncTimeout = 2 * time.Second
 	s.minBackoff = 10 * time.Millisecond
 	s.maxBackoff = 40 * time.Millisecond
 	s.resetAfter = time.Hour
-	t.Cleanup(s.Stop)
+	t.Cleanup(func() {
+		s.Stop()
+		f.killAll()
+	})
 	return s, logs
 }
 
 func TestNewSupervisorDefaults(t *testing.T) {
 	s := NewSupervisor(nil, nil)
-	if s.readyTimeout != readyTimeout || s.syncTimeout != syncTimeout || s.minBackoff != minBackoff || s.maxBackoff != maxBackoff || s.resetAfter != resetAfter {
-		t.Errorf("NewSupervisor = %+v", s)
+	if s.syncTimeout != 10*time.Second || s.minBackoff != time.Second || s.maxBackoff != 5*time.Second || s.resetAfter != time.Minute {
+		t.Errorf("defaults = %v %v %v %v", s.syncTimeout, s.minBackoff, s.maxBackoff, s.resetAfter)
 	}
-	if readyTimeout != 10*time.Second || syncTimeout != 10*time.Second || minBackoff != time.Second || maxBackoff != 30*time.Second || resetAfter != time.Minute {
-		t.Errorf("defaults changed")
+	// Sync never waits for the poller, and a restart is never slower than a
+	// gated sync is allowed to be.
+	if s.maxBackoff >= s.syncTimeout {
+		t.Errorf("maxBackoff %v is not below syncTimeout %v", s.maxBackoff, s.syncTimeout)
+	}
+	if maxLogLine != 4096 {
+		t.Errorf("maxLogLine = %d", maxLogLine)
 	}
 }
 
-func TestSupervisorStartAndSync(t *testing.T) {
-	f := &fakeRelay{stderr: "started\n"}
-	t.Cleanup(f.killAll)
-	s, logs := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	for i := 0; i < 3; i++ {
-		if err := s.Sync(context.Background()); err != nil {
-			t.Fatalf("Sync: %v", err)
-		}
+func TestSupervisorStartRunsPoller(t *testing.T) {
+	f := &fakeExec{}
+	s, _ := newSupervisor(t, f)
+	s.Start()
+	s.Start()
+	waitFor(t, "the poller", func() bool { return f.runCount() == 1 })
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runCount(); n != 1 {
+		t.Errorf("%d pollers after two Starts, want 1", n)
 	}
 	f.mu.Lock()
-	reqs := fmt.Sprint(f.reqs)
-	f.mu.Unlock()
-	if reqs != "[sync 1 sync 2 sync 3]" {
-		t.Errorf("requests = %v", reqs)
-	}
-	// A second Start does nothing.
-	if err := s.Start(context.Background()); err != nil {
-		t.Errorf("second Start: %v", err)
-	}
-	if n := f.runs.Load(); n != 1 {
-		t.Errorf("%d runs, want 1", n)
-	}
-	waitFor(t, "the relay's log", func() bool { return strings.Contains(logs.String(), "SDS relay: started") })
-}
-
-func TestSupervisorStartTimesOut(t *testing.T) {
-	f := &fakeRelay{ready: func(int) bool { return false }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	s.readyTimeout = 50 * time.Millisecond
-	err := s.Start(context.Background())
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Start = %v, want DeadlineExceeded", err)
-	}
-	// Every later sync fails, so that no process starts without the relay.
-	if err := s.Sync(context.Background()); err == nil || !strings.Contains(err.Error(), "did not become ready") {
-		t.Errorf("Sync after a failed Start = %v", err)
-	}
-}
-
-func TestSupervisorStartReportsExit(t *testing.T) {
-	s, _ := newSupervisor(t, func(stdin, stdout, stderr *os.File) error {
-		stdin.Close()
-		stdout.Close()
-		stderr.Close()
-		return errors.New("runsc exec failed")
-	})
-	s.readyTimeout = 100 * time.Millisecond
-	if err := s.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "runsc exec failed") {
-		t.Errorf("Start = %v, want the exit error", err)
-	}
-}
-
-func TestSupervisorStartHonorsContext(t *testing.T) {
-	f := &fakeRelay{ready: func(int) bool { return false }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := s.Start(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("Start = %v, want Canceled", err)
+	defer f.mu.Unlock()
+	if len(f.syncs) != 0 {
+		t.Errorf("Start ran %d syncs", len(f.syncs))
 	}
 }
 
 func TestSupervisorStartAfterStop(t *testing.T) {
-	f := &fakeRelay{ready: func(int) bool { return false }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		s.Stop()
-	}()
-	if err := s.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "stopped") {
-		t.Errorf("Start = %v", err)
+	f := &fakeExec{}
+	s, _ := newSupervisor(t, f)
+	s.Stop()
+	s.Stop()
+	s.Start()
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runCount(); n != 0 {
+		t.Errorf("Start after Stop ran %d pollers", n)
 	}
 }
 
-// TestSupervisorRestartsRelay checks that a relay that dies is restarted, and
-// that a sync waits for the new one.
-func TestSupervisorRestartsRelay(t *testing.T) {
-	f := &fakeRelay{}
-	t.Cleanup(f.killAll)
-	s, logs := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.kill(t, 1)
-	waitFor(t, "the relay to be gone", func() bool { return s.state().conn == nil })
-	if err := s.Sync(context.Background()); err != nil {
-		t.Fatalf("Sync after the relay died: %v", err)
-	}
-	if n := f.runs.Load(); n != 2 {
-		t.Errorf("%d runs, want 2", n)
-	}
-	if !strings.Contains(logs.String(), "run 1 killed") {
-		t.Errorf("log = %q, want the exit", logs.String())
-	}
-}
-
-// TestSupervisorSyncRetriesWhenRelayDies kills the relay while a request is in
-// flight.
-func TestSupervisorSyncRetriesWhenRelayDies(t *testing.T) {
-	f := &fakeRelay{}
-	f.answer = func(run int, id string) []string {
-		if run == 1 {
-			go f.killAll()
-			return nil
-		}
-		return []string{okReply + " " + id}
-	}
-	s, _ := newSupervisor(t, f.exec)
-	t.Cleanup(f.killAll)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+func TestSupervisorSyncRunsOnce(t *testing.T) {
+	f := &fakeExec{}
+	s, _ := newSupervisor(t, f)
 	if err := s.Sync(context.Background()); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if n := f.runs.Load(); n != 2 {
-		t.Errorf("%d runs, want 2", n)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.syncs) != 1 || !slices.Equal(f.syncs[0], []string{OnceFlag}) {
+		t.Errorf("syncs = %q, want one with %q", f.syncs, OnceFlag)
+	}
+	// A sync does not need the poller.
+	if f.runs != 0 {
+		t.Errorf("Sync started %d pollers", f.runs)
 	}
 }
 
-func TestSupervisorBacksOff(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		starts []time.Time
-	)
-	s, _ := newSupervisor(t, func(stdin, stdout, stderr *os.File) error {
-		mu.Lock()
-		starts = append(starts, time.Now())
-		mu.Unlock()
-		stdin.Close()
-		stdout.Close()
-		stderr.Close()
-		return errors.New("exited")
-	})
-	s.minBackoff = 20 * time.Millisecond
-	s.maxBackoff = 80 * time.Millisecond
-	go s.run()
-	waitFor(t, "six runs", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(starts) >= 6
-	})
-	s.Stop()
-	mu.Lock()
-	defer mu.Unlock()
-	// The delays are 20, 40, 80, 80, and 80 ms.
-	want := []time.Duration{20, 40, 80, 80, 80}
-	for i, w := range want {
-		got := starts[i+1].Sub(starts[i])
-		w *= time.Millisecond
-		if got < w || got > w+60*time.Millisecond {
-			t.Errorf("delay %d = %v, want about %v", i, got, w)
+func TestSupervisorSyncReportsFailure(t *testing.T) {
+	cause := errors.New("exit status 1: sync failed: a source file is still being written")
+	f := &fakeExec{once: func(context.Context) error { return cause }}
+	s, _ := newSupervisor(t, f)
+	err := s.Sync(context.Background())
+	if !errors.Is(err, cause) || !strings.HasPrefix(err.Error(), "SDS relay sync: ") {
+		t.Errorf("Sync = %v, want the relay's failure", err)
+	}
+}
+
+// waitDone returns once ctx ends, or fails after a while so that a sync
+// without a deadline fails rather than hangs.
+func waitDone(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		return errors.New("the sync's context never ended")
+	}
+}
+
+func TestSupervisorSyncTimesOut(t *testing.T) {
+	var deadline time.Duration
+	f := &fakeExec{once: func(ctx context.Context) error {
+		d, ok := ctx.Deadline()
+		if ok {
+			deadline = time.Until(d)
 		}
-	}
-}
-
-func TestSupervisorResetsBackoff(t *testing.T) {
-	var (
-		mu     sync.Mutex
-		starts []time.Time
-	)
-	s, _ := newSupervisor(t, func(stdin, stdout, stderr *os.File) error {
-		mu.Lock()
-		starts = append(starts, time.Now())
-		mu.Unlock()
-		stdin.Close()
-		stdout.Close()
-		stderr.Close()
-		return errors.New("exited")
-	})
-	s.minBackoff = 20 * time.Millisecond
-	s.maxBackoff = 500 * time.Millisecond
-	// Every run counts as a long one.
-	s.resetAfter = 0
-	go s.run()
-	waitFor(t, "four runs", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return len(starts) >= 4
-	})
-	s.Stop()
-	mu.Lock()
-	defer mu.Unlock()
-	for i := 1; i < 4; i++ {
-		if d := starts[i].Sub(starts[i-1]); d > 70*time.Millisecond {
-			t.Errorf("delay %d = %v, want about 20ms", i, d)
-		}
-	}
-}
-
-// TestSupervisorStopsRestarting covers a container that stops: the relay
-// gets SIGTERM with every other process and must not come back.
-func TestSupervisorStopsRestarting(t *testing.T) {
-	f := &fakeRelay{}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	s.Stop()
-	s.Stop()
-	f.kill(t, 1)
-	time.Sleep(100 * time.Millisecond)
-	if n := f.runs.Load(); n != 1 {
-		t.Errorf("%d runs after Stop, want 1", n)
-	}
-	// Processes started while the container stops are not held up.
-	if err := s.Sync(context.Background()); err != nil {
-		t.Errorf("Sync while stopping = %v", err)
-	}
-}
-
-func TestSupervisorStopDuringBackoff(t *testing.T) {
-	f := &fakeRelay{}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	s.minBackoff = time.Hour
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.kill(t, 1)
-	waitFor(t, "the relay to be gone", func() bool { return s.state().conn == nil })
-	s.Stop()
-	if err := s.Sync(context.Background()); err != nil {
-		t.Errorf("Sync while stopping = %v", err)
-	}
-	if n := f.runs.Load(); n != 1 {
-		t.Errorf("%d runs, want 1", n)
-	}
-}
-
-// TestSupervisorRelayReadyAfterStop checks that a relay that becomes ready
-// after Stop is not used.
-func TestSupervisorRelayReadyAfterStop(t *testing.T) {
-	s, _ := newSupervisor(t, nil)
-	s.Stop()
-	c := &conn{dead: make(chan struct{})}
-	s.setConn(c)
-	if s.state().conn != nil {
-		t.Error("setConn installed a relay after Stop")
-	}
-	s2, _ := newSupervisor(t, nil)
-	close(c.dead)
-	s2.setConn(c)
-	if s2.state().conn != nil {
-		t.Error("setConn installed a relay that had exited")
-	}
-}
-
-func TestSupervisorSyncWaitsForRestart(t *testing.T) {
-	f := &fakeRelay{ready: func(run int) bool { return run != 2 }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.kill(t, 1)
-	waitFor(t, "the relay to be gone", func() bool { return s.state().conn == nil })
-	// Run 2 never becomes ready; the sync waits for run 3.
-	go func() {
-		for f.runs.Load() < 2 {
-			time.Sleep(time.Millisecond)
-		}
-		f.mu.Lock()
-		close(f.kills[1])
-		f.mu.Unlock()
-	}()
-	if err := s.Sync(context.Background()); err != nil {
-		t.Fatalf("Sync: %v", err)
-	}
-	if n := f.runs.Load(); n != 3 {
-		t.Errorf("%d runs, want 3", n)
-	}
-}
-
-func TestSupervisorSyncTimesOutWithoutRelay(t *testing.T) {
-	f := &fakeRelay{ready: func(run int) bool { return run == 1 }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	f.kill(t, 1)
-	waitFor(t, "the relay to be gone", func() bool { return s.state().conn == nil })
+		return waitDone(ctx)
+	}}
+	s, _ := newSupervisor(t, f)
 	s.syncTimeout = 50 * time.Millisecond
-	if err := s.Sync(context.Background()); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "not running") {
-		t.Errorf("Sync = %v, want a timeout", err)
-	}
-}
-
-func TestSupervisorSyncBeforeStart(t *testing.T) {
-	s, _ := newSupervisor(t, nil)
-	s.syncTimeout = 50 * time.Millisecond
+	start := time.Now()
 	if err := s.Sync(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("Sync = %v, want a timeout", err)
 	}
-}
-
-func TestSupervisorSyncTimesOutWithoutReply(t *testing.T) {
-	f := &fakeRelay{answer: func(int, string) []string { return nil }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("Sync took %v", d)
 	}
-	s.syncTimeout = 50 * time.Millisecond
-	if err := s.Sync(context.Background()); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "waiting for the SDS relay") {
-		t.Errorf("Sync = %v, want a timeout", err)
+	if deadline <= 0 || deadline > 50*time.Millisecond {
+		t.Errorf("the sync ran with %v left, want at most 50ms", deadline)
 	}
 }
 
 func TestSupervisorSyncHonorsContext(t *testing.T) {
-	f := &fakeRelay{answer: func(int, string) []string { return nil }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
+	f := &fakeExec{once: waitDone}
+	s, _ := newSupervisor(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.Sync(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Sync = %v, want the context's error", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
+}
+
+func TestSupervisorSyncAfterStop(t *testing.T) {
+	f := &fakeExec{once: func(context.Context) error { return errors.New("container stopped") }}
+	s, _ := newSupervisor(t, f)
+	s.Stop()
+	if err := s.Sync(context.Background()); err != nil {
+		t.Errorf("Sync after Stop = %v, want nil", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.syncs) != 0 {
+		t.Errorf("Sync after Stop ran the relay")
+	}
+}
+
+// TestSupervisorSyncWhilePollerFails checks that a gated sync succeeds while
+// the poller keeps failing and is backing off.
+func TestSupervisorSyncWhilePollerFails(t *testing.T) {
+	f := &fakeExec{poll: func(int, *os.File, <-chan struct{}) error { return errors.New("no such container") }}
+	s, logs := newSupervisor(t, f)
+	s.minBackoff = time.Hour
+	s.maxBackoff = time.Hour
+	s.Start()
+	waitFor(t, "the first failure", func() bool { return logs.count("restarting in 1h0m0s") == 1 })
 	start := time.Now()
-	if err := s.Sync(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("Sync = %v", err)
+	if err := s.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
 	}
 	if d := time.Since(start); d > time.Second {
 		t.Errorf("Sync took %v", d)
 	}
 }
 
-func TestSupervisorSyncReportsFailure(t *testing.T) {
-	f := &fakeRelay{answer: func(_ int, id string) []string { return []string{errorReply + " " + id} }}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Sync(context.Background()); err == nil || !strings.Contains(err.Error(), "failed to sync") {
-		t.Errorf("Sync = %v, want a failure", err)
-	}
-}
-
-// TestSupervisorIgnoresStaleReplies checks that a reply to an earlier request
-// that timed out, or a malformed line, is not taken for the current reply.
-func TestSupervisorIgnoresStaleReplies(t *testing.T) {
-	f := &fakeRelay{}
-	f.answer = func(_ int, id string) []string {
-		return []string{"error 999", "garbage", "ok", "ok x", errorReply, okReply + " " + id}
-	}
-	t.Cleanup(f.killAll)
-	s, logs := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 5; i++ {
-		if err := s.Sync(context.Background()); err != nil {
-			t.Fatalf("Sync %d: %v", i, err)
-		}
-	}
-	if !strings.Contains(logs.String(), "malformed") {
-		t.Errorf("log = %q, want the malformed lines", logs.String())
-	}
-}
-
-// TestSupervisorKeepsNewestReply checks that replies nobody waits for never
-// block the relay.
-func TestSupervisorKeepsNewestReply(t *testing.T) {
-	f := &fakeRelay{}
-	f.answer = func(_ int, id string) []string {
-		lines := make([]string, 0, 101)
-		for i := 0; i < 100; i++ {
-			lines = append(lines, fmt.Sprintf("ok %d", 1000+i))
-		}
-		return append(lines, okReply+" "+id)
-	}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 3; i++ {
-		if err := s.Sync(context.Background()); err != nil {
-			t.Fatalf("Sync %d: %v", i, err)
-		}
-	}
-}
-
-// TestSupervisorDrainsLongLines checks that a line too long to parse does not
-// leave the relay blocked on a full pipe.
-func TestSupervisorDrainsLongLines(t *testing.T) {
-	long := strings.Repeat("x", 2*maxLine)
-	// More than a pipe holds.
-	flood := strings.Repeat(long+"\n", 32)
-	f := &fakeRelay{stderr: flood}
-	f.answer = func(run int, id string) []string {
-		if run == 1 {
-			return []string{flood}
-		}
-		return []string{okReply + " " + id}
-	}
-	t.Cleanup(f.killAll)
-	s, _ := newSupervisor(t, f.exec)
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	// The reader gives up on the protocol after the long line, so this sync
-	// times out, but it keeps draining the relay's output.
-	s.syncTimeout = 100 * time.Millisecond
-	if err := s.Sync(context.Background()); err == nil {
-		t.Fatal("Sync succeeded")
-	}
-	// A relay that is not blocked exits when it is killed, and is restarted.
+func TestSupervisorRestartsPoller(t *testing.T) {
+	f := &fakeExec{}
+	s, logs := newSupervisor(t, f)
+	s.Start()
 	f.kill(t, 1)
-	waitFor(t, "the restart", func() bool { return f.runs.Load() == 2 })
-	s.syncTimeout = 2 * time.Second
-	if err := s.Sync(context.Background()); err != nil {
-		t.Errorf("Sync after the restart: %v", err)
+	waitFor(t, "the restart", func() bool { return f.runCount() == 2 })
+	if !strings.Contains(logs.String(), "SDS relay exited, restarting in 10ms: run 1 killed") {
+		t.Errorf("log = %q", logs.String())
 	}
 }
 
-func TestParseReply(t *testing.T) {
-	for line, want := range map[string]struct {
-		r  reply
-		ok bool
-	}{
-		"ok 1":    {reply{1, true}, true},
-		"error 2": {reply{2, false}, true},
-		"ok":      {reply{}, false},
-		"ok x":    {reply{}, false},
-		"fine 1":  {reply{}, false},
-		"ready":   {reply{}, false},
-		"ok -1":   {reply{}, false},
-		"OK 1":    {reply{}, false},
-	} {
-		r, ok := parseReply(line)
-		if ok != want.ok || r != want.r {
-			t.Errorf("parseReply(%q) = %+v, %v; want %+v, %v", line, r, ok, want.r, want.ok)
+func TestSupervisorRestartsPollerThatExitsCleanly(t *testing.T) {
+	f := &fakeExec{poll: func(run int, _ *os.File, killed <-chan struct{}) error {
+		if run == 1 {
+			return nil
+		}
+		<-killed
+		return nil
+	}}
+	s, logs := newSupervisor(t, f)
+	s.Start()
+	waitFor(t, "the restart", func() bool { return f.runCount() == 2 })
+	if !strings.Contains(logs.String(), "exited without an error") {
+		t.Errorf("log = %q", logs.String())
+	}
+}
+
+func TestSupervisorBacksOff(t *testing.T) {
+	f := &fakeExec{poll: func(int, *os.File, <-chan struct{}) error { return errors.New("failed") }}
+	s, logs := newSupervisor(t, f)
+	s.Start()
+	waitFor(t, "five restarts", func() bool { return logs.count("restarting") >= 5 })
+	s.Stop()
+	got := logs.String()
+	for i, want := range []string{"10ms", "20ms", "40ms", "40ms", "40ms"} {
+		line := strings.Split(got, "\n")[i]
+		if !strings.Contains(line, "restarting in "+want+":") {
+			t.Errorf("restart %d: %q, want a delay of %s", i+1, line, want)
 		}
 	}
 }
 
-func TestConnSyncWriteErrors(t *testing.T) {
+func TestSupervisorWaitsBeforeRestart(t *testing.T) {
+	f := &fakeExec{poll: func(int, *os.File, <-chan struct{}) error { return errors.New("failed") }}
+	s, _ := newSupervisor(t, f)
+	s.minBackoff = 200 * time.Millisecond
+	s.maxBackoff = 200 * time.Millisecond
+	start := time.Now()
+	s.Start()
+	waitFor(t, "the second run", func() bool { return f.runCount() == 2 })
+	if d := time.Since(start); d < 200*time.Millisecond {
+		t.Errorf("restarted after %v, want at least 200ms", d)
+	}
+}
+
+func TestSupervisorResetsBackoff(t *testing.T) {
+	f := &fakeExec{poll: func(run int, _ *os.File, _ <-chan struct{}) error {
+		if run == 4 {
+			time.Sleep(60 * time.Millisecond)
+		}
+		return errors.New("failed")
+	}}
+	s, logs := newSupervisor(t, f)
+	s.resetAfter = 50 * time.Millisecond
+	s.Start()
+	waitFor(t, "five restarts", func() bool { return logs.count("restarting") >= 5 })
+	s.Stop()
+	lines := strings.Split(logs.String(), "\n")
+	for i, want := range []string{"10ms", "20ms", "40ms", "10ms", "20ms"} {
+		if !strings.Contains(lines[i], "restarting in "+want+":") {
+			t.Errorf("restart %d: %q, want a delay of %s", i+1, lines[i], want)
+		}
+	}
+}
+
+func TestSupervisorStopsRestarting(t *testing.T) {
+	f := &fakeExec{}
+	s, logs := newSupervisor(t, f)
+	s.Start()
+	waitFor(t, "the poller", func() bool { return f.runCount() == 1 })
+	s.Stop()
+	f.kill(t, 1)
+	time.Sleep(100 * time.Millisecond)
+	if n := f.runCount(); n != 1 {
+		t.Errorf("%d runs after Stop, want 1", n)
+	}
+	if strings.Contains(logs.String(), "restarting") {
+		t.Errorf("log = %q after Stop", logs.String())
+	}
+}
+
+func TestSupervisorStopDuringBackoff(t *testing.T) {
+	f := &fakeExec{poll: func(int, *os.File, <-chan struct{}) error { return errors.New("failed") }}
+	s, logs := newSupervisor(t, f)
+	s.minBackoff = time.Hour
+	s.Start()
+	waitFor(t, "the backoff", func() bool { return logs.count("restarting") == 1 })
+	s.Stop()
+	time.Sleep(50 * time.Millisecond)
+	if n := f.runCount(); n != 1 {
+		t.Errorf("%d runs, want 1", n)
+	}
+}
+
+func TestSupervisorForwardsLog(t *testing.T) {
+	long := strings.Repeat("x", 2*maxLogLine)
+	f := &fakeExec{poll: func(run int, stderr *os.File, killed <-chan struct{}) error {
+		if run == 1 {
+			// A line too long to log, then more than a pipe holds.
+			fmt.Fprintf(stderr, "updated \"envoy.yaml\"\n%s\n", long)
+			for i := 0; i < 32; i++ {
+				fmt.Fprintln(stderr, long)
+			}
+			return errors.New("done")
+		}
+		fmt.Fprintln(stderr, "sync recovered")
+		<-killed
+		return nil
+	}}
+	s, logs := newSupervisor(t, f)
+	s.Start()
+	waitFor(t, "the second run's log", func() bool { return strings.Contains(logs.String(), "SDS relay: sync recovered") })
+	if !strings.Contains(logs.String(), `SDS relay: updated "envoy.yaml"`) {
+		t.Errorf("log = %q", logs.String())
+	}
+	if strings.Contains(logs.String(), long[:maxLogLine]) {
+		t.Errorf("logged a line longer than %d bytes", maxLogLine)
+	}
+}
+
+// fakeRunsc writes a runsc that records its arguments and process spec in
+// dir, writes to stderr, and exits with the status in $FAKE_RUNSC_EXIT.
+func fakeRunsc(t *testing.T) (*runsccmd.Runsc, string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "runsc")
+	body := `#!/bin/sh
+echo "$@" > "` + dir + `/args"
+while [ $# -gt 0 ]; do
+	if [ "$1" = --process ]; then cp "$2" "` + dir + `/process.json"; fi
+	shift
+done
+echo "relay says hello" >&2
+exit ${FAKE_RUNSC_EXIT:-0}
+`
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return &runsccmd.Runsc{Command: script, Root: "/run/runsc"}, dir
+}
+
+func TestRunscExecSync(t *testing.T) {
+	runtime, dir := fakeRunsc(t)
+	run := RunscExec(runtime, "c1")
+	if err := run(context.Background(), []string{OnceFlag}, nil); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	args, err := os.ReadFile(filepath.Join(dir, "args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Fields(string(args)); got[0] != "--root=/run/runsc" || got[1] != "exec" || got[len(got)-1] != "c1" || slices.Contains(got, "--detach") {
+		t.Errorf("runsc %q", got)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "process.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p specs.Process
+	if err := json.Unmarshal(data, &p); err != nil {
+		t.Fatal(err)
+	}
+	if want := Process(OnceFlag); !slices.Equal(p.Args, want.Args) || !slices.Equal(p.Env, want.Env) {
+		t.Errorf("process = %+v, want %+v", p, want)
+	}
+
+	// A failed sync carries the relay's output.
+	t.Setenv("FAKE_RUNSC_EXIT", "1")
+	if err := run(context.Background(), []string{OnceFlag}, nil); err == nil || !strings.Contains(err.Error(), "relay says hello") {
+		t.Errorf("exec = %v, want the relay's output", err)
+	}
+}
+
+func TestRunscExecPoller(t *testing.T) {
+	runtime, dir := fakeRunsc(t)
+	run := RunscExec(runtime, "c1")
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Close()
-	c := &conn{stdin: w, replies: make(chan reply, 1), dead: make(chan struct{})}
-	defer w.Close()
-	// The relay closed its stdin.
-	if err := c.sync(context.Background(), 1); !errors.Is(err, errConnGone) {
-		t.Errorf("sync = %v, want errConnGone", err)
+	defer r.Close()
+	if err := run(context.Background(), nil, w); err != nil {
+		t.Fatalf("exec: %v", err)
 	}
-	close(c.dead)
-	if err := c.sync(context.Background(), 2); !errors.Is(err, errConnGone) {
-		t.Errorf("sync = %v, want errConnGone", err)
+	// RunscExec closed the write end, so the read ends.
+	sc := bufio.NewScanner(r)
+	var lines []string
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
 	}
-
-	// A relay that stops reading fills the pipe, and the write times out.
-	r2, w2, err := os.Pipe()
+	if !slices.Equal(lines, []string{"relay says hello"}) {
+		t.Errorf("stderr = %q", lines)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "process.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer r2.Close()
-	defer w2.Close()
-	big := make([]byte, 1<<20)
-	w2.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
-	w2.Write(big)
-	c2 := &conn{stdin: w2, replies: make(chan reply, 1), dead: make(chan struct{})}
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-	if err := c2.sync(ctx, 3); !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "sending") {
-		t.Errorf("sync = %v, want a send timeout", err)
+	var p specs.Process
+	if err := json.Unmarshal(data, &p); err != nil {
+		t.Fatal(err)
+	}
+	if want := Process(); !slices.Equal(p.Args, want.Args) {
+		t.Errorf("args = %q, want %q", p.Args, want.Args)
+	}
+
+	t.Setenv("FAKE_RUNSC_EXIT", "3")
+	_, w2, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run(context.Background(), nil, w2); err == nil {
+		t.Error("exec of a failed poller succeeded")
+	}
+	if _, err := w2.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Error("RunscExec left the write end open")
+	}
+
+	// A runsc that cannot start still closes the write end.
+	_, w3, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := RunscExec(&runsccmd.Runsc{Command: filepath.Join(dir, "missing")}, "c1")
+	if err := missing(context.Background(), nil, w3); err == nil {
+		t.Error("exec of a missing runsc succeeded")
+	}
+	if _, err := w3.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Error("RunscExec left the write end open")
+	}
+}
+
+func TestStderrIO(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fio := &stderrIO{stderr: f}
+	cmd := &exec.Cmd{}
+	fio.Set(cmd)
+	if cmd.Stdin != nil || cmd.Stdout != nil || cmd.Stderr != f {
+		t.Errorf("Set = %v %v %v", cmd.Stdin, cmd.Stdout, cmd.Stderr)
+	}
+	if fio.Stdin() != nil || fio.Stdout() != nil || fio.Stderr() != nil {
+		t.Error("stderrIO returned a parent end")
+	}
+	if err := fio.CloseAfterStart(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fio.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Error("stderr still open")
 	}
 }
 
@@ -640,86 +563,80 @@ func TestConnSyncWriteErrors(t *testing.T) {
 func TestSupervisorWithRelay(t *testing.T) {
 	r, _ := newRelay(t)
 	path := filepath.Join(r.Source, "sds-id-cert-and-key.yaml")
+	target := filepath.Join(r.Target, "sds-id-cert-and-key.yaml")
 	writeFile(t, path, "serial: 1\n", 0o644)
 
-	var cmds sync.Map
-	run := func(stdin, stdout, stderr *os.File) error {
-		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperMain$", "--", "--source", r.Source, "--target", r.Target, "--interval", "1h")
+	var mu sync.Mutex
+	var pollers []*exec.Cmd
+	run := func(ctx context.Context, extra []string, stderr *os.File) error {
+		cmd := exec.CommandContext(ctx, os.Args[0], append([]string{"-test.run=^TestHelperMain$", "--", "--source", r.Source, "--target", r.Target}, extra...)...)
 		cmd.Env = append(os.Environ(), helperEnv+"=1")
-		fio := &fileIO{stdin: stdin, stdout: stdout, stderr: stderr}
-		defer fio.Close()
-		fio.Set(cmd)
+		if stderr == nil {
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%w: %s", err, out)
+			}
+			return nil
+		}
+		defer stderr.Close()
+		cmd.Stderr = stderr
 		if err := cmd.Start(); err != nil {
 			return err
 		}
-		cmds.Store(cmd, true)
-		fio.CloseAfterStart()
+		mu.Lock()
+		pollers = append(pollers, cmd)
+		mu.Unlock()
+		stderr.Close()
 		return cmd.Wait()
 	}
-	s, logs := newSupervisor(t, run)
+	killPollers := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range pollers {
+			c.Process.Kill()
+		}
+	}
+	logs := &logBuffer{}
+	s := NewSupervisor(run, logs.logf)
+	s.minBackoff = 10 * time.Millisecond
 	t.Cleanup(func() {
 		s.Stop()
-		cmds.Range(func(k, _ any) bool {
-			k.(*exec.Cmd).Process.Kill()
-			return true
-		})
+		killPollers()
 	})
-	if err := s.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	if got := content(filepath.Join(r.Target, "sds-id-cert-and-key.yaml")); got != "serial: 1\n" {
-		t.Errorf("copy = %q after Start", got)
-	}
+	s.Start()
+	waitFor(t, "the poller's first copy", func() bool { return content(target) == "serial: 1\n" })
+
 	replaceFile(t, path, "serial: 2\n")
 	if err := s.Sync(context.Background()); err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
-	if got := content(filepath.Join(r.Target, "sds-id-cert-and-key.yaml")); got != "serial: 2\n" {
+	if got := content(target); got != "serial: 2\n" {
 		t.Errorf("copy = %q after Sync", got)
 	}
 
-	// Kill the relay; the next sync uses its replacement.
-	cmds.Range(func(k, _ any) bool {
-		k.(*exec.Cmd).Process.Kill()
-		return true
-	})
+	// Kill the poller; it is restarted, and a sync works meanwhile.
+	killPollers()
 	replaceFile(t, path, "serial: 3\n")
 	if err := s.Sync(context.Background()); err != nil {
-		t.Fatalf("Sync after the relay died: %v", err)
+		t.Fatalf("Sync after the poller died: %v", err)
 	}
-	if got := content(filepath.Join(r.Target, "sds-id-cert-and-key.yaml")); got != "serial: 3\n" {
-		t.Errorf("copy = %q after the restart", got)
+	if got := content(target); got != "serial: 3\n" {
+		t.Errorf("copy = %q after the poller died", got)
 	}
-	waitFor(t, "the relay's log", func() bool { return strings.Contains(logs.String(), `SDS relay: updated "sds-id-cert-and-key.yaml"`) })
-}
+	waitFor(t, "the restart", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(pollers) == 2
+	})
+	replaceFile(t, path, "serial: 4\n")
+	waitFor(t, "the new poller's copy", func() bool { return content(target) == "serial: 4\n" })
+	waitFor(t, "the poller's log", func() bool { return strings.Contains(logs.String(), `SDS relay: updated "sds-id-cert-and-key.yaml"`) })
 
-func TestFileIO(t *testing.T) {
-	var files []*os.File
-	for i := 0; i < 3; i++ {
-		f, err := os.CreateTemp(t.TempDir(), "io")
-		if err != nil {
-			t.Fatal(err)
-		}
-		files = append(files, f)
-	}
-	fio := &fileIO{stdin: files[0], stdout: files[1], stderr: files[2]}
-	cmd := &exec.Cmd{}
-	fio.Set(cmd)
-	if cmd.Stdin != files[0] || cmd.Stdout != files[1] || cmd.Stderr != files[2] {
-		t.Errorf("Set = %v %v %v", cmd.Stdin, cmd.Stdout, cmd.Stderr)
-	}
-	if fio.Stdin() != nil || fio.Stdout() != nil || fio.Stderr() != nil {
-		t.Error("the parent ends are not the fileIO's")
-	}
-	if err := fio.CloseAfterStart(); err != nil {
+	// A sync fails when the source is gone.
+	if err := os.RemoveAll(r.Source); err != nil {
 		t.Fatal(err)
 	}
-	if err := fio.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range files {
-		if _, err := f.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
-			t.Errorf("%s still open", f.Name())
-		}
+	if err := s.Sync(context.Background()); err == nil || !strings.Contains(err.Error(), "sync failed") {
+		t.Errorf("Sync without a source = %v, want the relay's failure", err)
 	}
 }
