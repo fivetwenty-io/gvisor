@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	"gvisor.dev/gvisor/pkg/shim/v1/sdsrelay"
 	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -613,12 +614,14 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 	s.mu.Lock()
 	var (
 		containerID string
+		exitingC    *Container
 		exitingP    process.Process
 	)
 	for cid, c := range s.containers {
 		for _, p := range c.All() {
 			if p.ID() == e.ID {
 				containerID = cid
+				exitingC = c
 				exitingP = p
 				break
 			}
@@ -635,6 +638,8 @@ func (s *runscService) checkProcesses(ctx context.Context, e proc.Exit) {
 
 	ip, isInit := p.(*proc.Init)
 	if isInit {
+		// The relay dies with the other processes and must not be restarted.
+		exitingC.StopRelay()
 		// Ensure all children are killed.
 		log.L.Debugf("Container init process exited, killing all container processes")
 		ip.KillAll(ctx)
@@ -747,21 +752,28 @@ func getTopic(e any) string {
 	return runtime.TaskUnknownTopic
 }
 
-func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateConfig, options *Options, rootfs string) (*proc.Init, error) {
+// newInit returns the init process of a new container, and whether the
+// container needs the SDS relay.
+func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateConfig, options *Options, rootfs string) (*proc.Init, bool, error) {
 	spec, err := utils.ReadSpec(r.Bundle)
 	if err != nil {
-		return nil, fmt.Errorf("read oci spec: %w", err)
+		return nil, false, fmt.Errorf("read oci spec: %w", err)
 	}
 
 	updated, err := utils.UpdateVolumeAnnotations(spec)
 	if err != nil {
-		return nil, fmt.Errorf("update volume annotations: %w", err)
+		return nil, false, fmt.Errorf("update volume annotations: %w", err)
 	}
 	updated = setPodCgroup(spec) || updated
+	relay, err := setSDSRelay(spec)
+	if err != nil {
+		return nil, false, err
+	}
+	updated = relay || updated
 
 	if updated {
 		if err := utils.WriteSpec(r.Bundle, spec); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
@@ -787,7 +799,29 @@ func newInit(workDir, namespace string, platform stdio.Platform, r *proc.CreateC
 	// spec or the pod sandbox spec.
 	p.FuseAbort = utils.FuseAbortOnTeardown(spec, r.Bundle)
 	p.Monitor = reaper.Default
-	return p, nil
+	return p, relay, nil
+}
+
+// setSDSRelay rewrites a sandbox's spec so that the SDS relay can mirror
+// Diego's Envoy configuration into it. It returns true when the container
+// needs the relay.
+func setSDSRelay(spec *specs.Spec) (bool, error) {
+	if !utils.IsSandbox(spec) {
+		if sdsrelay.HasEnvoyConfigMount(spec) {
+			log.L.Warningf("Envoy in subcontainer will not reload its SDS files: the SDS relay runs only in a sandbox's root container")
+		}
+		return false, nil
+	}
+	// RewriteSpec needs the binary only when it rewrites the spec.
+	binary, exeErr := os.Executable()
+	relay, err := sdsrelay.RewriteSpec(spec, binary)
+	if err != nil {
+		if exeErr != nil {
+			err = exeErr
+		}
+		return false, fmt.Errorf("set up the SDS relay: %w", err)
+	}
+	return relay, nil
 }
 
 // setPodCgroup searches for the pod cgroup path inside the container's cgroup

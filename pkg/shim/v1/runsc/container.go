@@ -38,12 +38,14 @@ import (
 	"github.com/containerd/log"
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/types/known/anypb"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/shim/v1/extension"
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 	"gvisor.dev/gvisor/pkg/shim/v1/runtimeoptions"
+	"gvisor.dev/gvisor/pkg/shim/v1/sdsrelay"
 )
 
 // CgroupMode is the cgroups mode that is being used by the container.
@@ -71,6 +73,17 @@ type Container struct {
 
 	// cgroup is the cgroups mode that is being used by the container.
 	cgroup CgroupMode
+
+	// relay keeps the container's copy of Diego's Envoy configuration current.
+	// It is nil when the container has no such configuration.
+	relay relayGate
+}
+
+// relayGate is the part of sdsrelay.Supervisor that a container uses.
+type relayGate interface {
+	Start(ctx context.Context) error
+	Sync(ctx context.Context) error
+	Stop()
 }
 
 // ContainerConfig contains configuration for creating a container.
@@ -202,7 +215,7 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		FSRestoreDirect:    conf.FSRestoreDirect,
 	}
 
-	process, err := newInit(filepath.Join(conf.Bundle, "work"), ns, platform, config, &opts, st.Rootfs)
+	process, relay, err := newInit(filepath.Join(conf.Bundle, "work"), ns, platform, config, &opts, st.Rootfs)
 	if err != nil {
 		return nil, err
 	}
@@ -223,6 +236,9 @@ func NewContainer(ctx context.Context, platform stdio.Platform, conf *ContainerC
 		task:      process,
 		cgroup:    cgroupMode,
 		processes: make(map[string]extension.Process),
+	}
+	if relay {
+		c.relay = sdsrelay.NewSupervisor(sdsrelay.RunscExec(process.Runtime(), conf.ID), log.L.Infof)
 	}
 	return &c, nil
 }
@@ -299,10 +315,32 @@ func (c *Container) Start(ctx context.Context, r *task.StartRequest) (extension.
 	if err != nil {
 		return nil, err
 	}
-	if err := p.Start(ctx); err != nil {
+	if err := startProcess(ctx, p, r.ExecID == "", c.relay); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// startProcess starts p. With a relay, an exec starts only once the relay's
+// copies are current, and init's start also starts the relay.
+func startProcess(ctx context.Context, p extension.Process, init bool, relay relayGate) error {
+	if !init && relay != nil {
+		// Envoy runs as an exec, and it must find the current copies of its
+		// configuration when it starts.
+		if err := relay.Sync(ctx); err != nil {
+			return fmt.Errorf("sync Envoy configuration: %w", err)
+		}
+	}
+	if err := p.Start(ctx); err != nil {
+		return err
+	}
+	if init && relay != nil {
+		// The relay runs as an exec, which needs a running container.
+		if err := relay.Start(ctx); err != nil {
+			return fmt.Errorf("start SDS relay: %w", err)
+		}
+	}
+	return nil
 }
 
 // Delete the container or a process by id
@@ -310,6 +348,9 @@ func (c *Container) Delete(ctx context.Context, r *task.DeleteRequest) (extensio
 	p, err := c.Process(r.ExecID)
 	if err != nil {
 		return nil, err
+	}
+	if r.ExecID == "" {
+		c.StopRelay()
 	}
 	if err := p.Delete(ctx); err != nil {
 		return nil, err
@@ -379,7 +420,23 @@ func (c *Container) Kill(ctx context.Context, r *task.KillRequest) error {
 		log.L.Debugf("Kill failed: %v", err)
 		return err
 	}
+	if stopsContainer(r) {
+		c.StopRelay()
+	}
 	return p.Kill(ctx, r.Signal, r.All)
+}
+
+// stopsContainer reports whether r stops every process in the container. The
+// relay receives the signal too and must then not be restarted.
+func stopsContainer(r *task.KillRequest) bool {
+	return r.ExecID == "" && r.All && (r.Signal == uint32(unix.SIGTERM) || r.Signal == uint32(unix.SIGKILL))
+}
+
+// StopRelay stops restarting the container's SDS relay, if it has one.
+func (c *Container) StopRelay() {
+	if c.relay != nil {
+		c.relay.Stop()
+	}
 }
 
 // CloseIO of a process.
@@ -416,6 +473,13 @@ func (c *Container) Restore(ctx context.Context, r *extension.RestoreRequest) (e
 	}
 	if err := p.Restore(ctx, &r.Conf); err != nil {
 		return nil, err
+	}
+	if r.Start.ExecID == "" && c.relay != nil {
+		// A restored sandbox holds the checkpointed relay, whose pipes to the
+		// old shim are gone, so a new relay serves this shim.
+		if err := c.relay.Start(ctx); err != nil {
+			return nil, fmt.Errorf("start SDS relay: %w", err)
+		}
 	}
 	// TODO: Set the cgroup and oom notifications on restore.
 	// https://github.com/google/gvisor-containerd-shim/issues/58

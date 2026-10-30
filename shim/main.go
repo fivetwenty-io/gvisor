@@ -16,9 +16,17 @@
 package main
 
 import (
+	"os"
+
+	"gvisor.dev/gvisor/pkg/shim/v1/sdsrelay"
 	"gvisor.dev/gvisor/shim/v1/cli"
 )
 
 func main() {
+	// The shim mounts its own binary into sandboxes that need the SDS relay
+	// and runs it there with this subcommand.
+	if len(os.Args) > 1 && os.Args[1] == sdsrelay.Subcommand {
+		os.Exit(sdsrelay.Main(os.Args[2:]))
+	}
 	cli.Main()
 }
