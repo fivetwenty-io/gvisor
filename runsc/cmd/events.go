@@ -18,12 +18,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
@@ -37,6 +39,9 @@ type Events struct {
 	intervalSec int
 	// If true, events will print a single group of stats and exit.
 	stats bool
+	// If true, the output also carries the Sentry's raw per-container CPU
+	// usage, as the event's "containerUsage" sibling.
+	sentryUsage bool
 }
 
 // Name implements subcommands.Command.Name.
@@ -66,6 +71,7 @@ OPTIONS:
 func (evs *Events) SetFlags(f *flag.FlagSet) {
 	f.IntVar(&evs.intervalSec, "interval", 5, "set the stats collection interval, in seconds")
 	f.BoolVar(&evs.stats, "stats", false, "display the container's stats then exit")
+	f.BoolVar(&evs.sentryUsage, "sentry-usage", false, "also print the Sentry's own CPU usage of each container in the sandbox, in nanoseconds, without scaling it to the sandbox cgroup")
 }
 
 // FetchSpec implements util.SubCommand.FetchSpec.
@@ -75,6 +81,17 @@ func (evs *Events) FetchSpec(conf *config.Config, f *flag.FlagSet) (string, *spe
 		return "", nil, fmt.Errorf("loading container: %w", err)
 	}
 	return c.ID, c.Spec, nil
+}
+
+// encodeEvent writes ev as one JSON object. Without sentryUsage it writes only
+// the event, which is the output of the command before the flag existed. With
+// it, it writes the whole result, so the Sentry's per-container usage comes
+// along unscaled.
+func encodeEvent(w io.Writer, ev *boot.EventOut, sentryUsage bool) error {
+	if sentryUsage {
+		return json.NewEncoder(w).Encode(ev)
+	}
+	return json.NewEncoder(w).Encode(ev.Event)
 }
 
 // Execute implements subcommands.Command.Execute.
@@ -105,7 +122,7 @@ func (evs *Events) Execute(_ context.Context, f *flag.FlagSet, args ...any) subc
 		}
 		log.Debugf("Events: %+v", ev)
 
-		if err := json.NewEncoder(os.Stdout).Encode(ev.Event); err != nil {
+		if err := encodeEvent(os.Stdout, ev, evs.sentryUsage); err != nil {
 			log.Warningf("Error encoding event %+v: %v", ev.Event, err)
 			if evs.stats {
 				return subcommands.ExitFailure
